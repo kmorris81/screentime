@@ -1,0 +1,446 @@
+//! screentime-agent: runs in the managed user's desktop session.
+//!
+//! - Watches for keyboard/mouse inactivity with the Wayland ext-idle-notify
+//!   protocol and reports it to screentimed in periodic heartbeats.
+//! - Shows the time left as a tray icon (StatusNotifierItem).
+//! - Sends desktop notifications as time runs low.
+//! - When time is up, logs out through Plasma (like the Log Out button), so
+//!   KWin shuts down cleanly and SDDM comes back. The daemon only kills the
+//!   session itself if that didn't happen.
+//!
+//! If anything here fails, the daemon simply stops hearing "idle" and keeps
+//! counting, so the agent can't be used to dodge the limit.
+
+use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use ksni::TrayMethods;
+use tokio::sync::watch;
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
+use wayland_client::protocol::{wl_registry, wl_seat};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1::{self, ExtIdleNotificationV1},
+    ext_idle_notifier_v1::ExtIdleNotifierV1,
+};
+use zbus::zvariant::Value;
+
+use screentime::config::{self, Config};
+use screentime::dbus::{DaemonProxy, NotificationsProxy, daemon_bus};
+use screentime::{Status, duration, icon};
+
+const POLL: Duration = Duration::from_secs(10);
+const WARN_MINUTES: [u64; 3] = [10, 5, 1];
+
+// ---------------------------------------------------------------- idle ----
+
+struct IdleState {
+    tx: watch::Sender<bool>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for IdleState {
+    fn event(
+        _: &mut Self,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for IdleState {
+    fn event(
+        _: &mut Self,
+        _: &wl_seat::WlSeat,
+        _: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtIdleNotifierV1, ()> for IdleState {
+    fn event(
+        _: &mut Self,
+        _: &ExtIdleNotifierV1,
+        _: <ExtIdleNotifierV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtIdleNotificationV1, ()> for IdleState {
+    fn event(
+        state: &mut Self,
+        _: &ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => {
+                let _ = state.tx.send(true);
+            }
+            ext_idle_notification_v1::Event::Resumed => {
+                let _ = state.tx.send(false);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Blocks forever, sending idle/active transitions on `tx`.
+fn watch_idle(timeout: Duration, input_only: bool, tx: watch::Sender<bool>) -> Result<()> {
+    let conn = Connection::connect_to_env().context("connecting to Wayland")?;
+    let (globals, mut queue) = registry_queue_init::<IdleState>(&conn)?;
+    let qh = queue.handle();
+    let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=1, ())?;
+    let notifier: ExtIdleNotifierV1 = globals
+        .bind(&qh, 1..=2, ())
+        .context("compositor lacks ext_idle_notifier_v1")?;
+    let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    // v2's input-idle notification ignores idle inhibitors (e.g. a playing
+    // video), so only real keyboard/mouse input counts as activity.
+    let _notification = if input_only && notifier.version() >= 2 {
+        notifier.get_input_idle_notification(ms, &seat, &qh, ())
+    } else {
+        if input_only {
+            eprintln!("compositor only has ext_idle_notifier_v1 v1; idle inhibitors apply");
+        }
+        notifier.get_idle_notification(ms, &seat, &qh, ())
+    };
+    let mut state = IdleState { tx };
+    loop {
+        queue.blocking_dispatch(&mut state)?;
+    }
+}
+
+// ---------------------------------------------------------------- tray ----
+
+#[derive(Debug, Default)]
+struct Tray {
+    status: Option<Status>,
+}
+
+impl Tray {
+    fn summary(&self) -> String {
+        match &self.status {
+            None => "Screen time: waiting for the service".into(),
+            Some(st) if st.unlimited => "No screen-time limit today".into(),
+            Some(st) if st.allowed_now => {
+                format!("{} left today", duration::format(st.remaining_secs))
+            }
+            Some(_) => "No screen time left right now".into(),
+        }
+    }
+
+    fn details(&self) -> Vec<String> {
+        let Some(st) = &self.status else {
+            return vec![];
+        };
+        let mut lines = vec![format!(
+            "Used {} of {}",
+            duration::format(st.used_secs),
+            duration::format(st.limit_secs)
+        )];
+        if let Some(end) = &st.window_end {
+            lines.push(format!("Allowed until {end}"));
+        }
+        if !st.allowed_now
+            && let Some(next) = &st.next_window
+        {
+            lines.push(format!("Next: {next}"));
+        }
+        if st.allowed_now && !st.counting {
+            lines.push("Paused (idle)".into());
+        }
+        lines
+    }
+}
+
+impl ksni::Tray for Tray {
+    fn id(&self) -> String {
+        "screentime".into()
+    }
+    fn title(&self) -> String {
+        "Screen time".into()
+    }
+    fn category(&self) -> ksni::Category {
+        ksni::Category::SystemServices
+    }
+    fn icon_name(&self) -> String {
+        // Only used if the host can't show pixmaps.
+        "chronometer".into()
+    }
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        let (remaining, unlimited) = self
+            .status
+            .as_ref()
+            .map_or((0, false), |s| (s.remaining_secs, s.unlimited));
+        let p = icon::render(remaining, unlimited);
+        vec![ksni::Icon {
+            width: p.size,
+            height: p.size,
+            data: p.data,
+        }]
+    }
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            title: self.summary(),
+            description: self.details().join("\n"),
+            ..Default::default()
+        }
+    }
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+        std::iter::once(self.summary())
+            .chain(self.details())
+            .map(|label| {
+                StandardItem {
+                    label,
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into()
+            })
+            .collect()
+    }
+}
+
+// ------------------------------------------------------- notifications ----
+
+#[derive(Default)]
+struct Warnings {
+    /// Seconds between running out and the logout, for the message.
+    grace_secs: u64,
+    sent: BTreeSet<u64>,
+    out_sent: bool,
+}
+
+impl Warnings {
+    /// The notification due for this status, if any: (summary, body, critical).
+    fn due(&mut self, st: &Status) -> Option<(String, String, bool)> {
+        if !st.allowed_now {
+            if self.out_sent {
+                return None;
+            }
+            self.out_sent = true;
+            let when = match self.grace_secs {
+                0 => "now".to_string(),
+                s => format!("in {s} seconds"),
+            };
+            return Some((
+                "Screen time is up".into(),
+                format!("You'll be logged out {when}. Save your work!"),
+                true,
+            ));
+        }
+        self.out_sent = false;
+        // Forget warnings that no longer apply (e.g. after bonus time).
+        self.sent.retain(|m| st.remaining_secs <= m * 60);
+        let minute = WARN_MINUTES
+            .iter()
+            .copied()
+            .filter(|m| st.remaining_secs <= m * 60 && !self.sent.contains(m))
+            .min()?;
+        // Mark this and any larger threshold so we don't fire them all at once.
+        self.sent
+            .extend(WARN_MINUTES.iter().filter(|m| **m >= minute));
+        let left = st.remaining_secs.div_ceil(60);
+        let plural = if left == 1 { "" } else { "s" };
+        Some((
+            format!("{left} minute{plural} of screen time left"),
+            match &st.window_end {
+                Some(end) if st.remaining_secs < st.limit_secs.saturating_sub(st.used_secs) => {
+                    format!("Allowed time ends at {end}.")
+                }
+                _ => "Time to start wrapping up.".into(),
+            },
+            left <= 1,
+        ))
+    }
+}
+
+async fn notify(conn: &zbus::Connection, summary: &str, body: &str, critical: bool) -> Result<()> {
+    let proxy = NotificationsProxy::new(conn).await?;
+    let mut hints = HashMap::new();
+    hints.insert("urgency", Value::U8(if critical { 2 } else { 1 }));
+    proxy
+        .notify(
+            "Screen time",
+            0,
+            "chronometer",
+            summary,
+            body,
+            &[],
+            hints,
+            -1,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Ask Plasma to end the session, the same as Log Out in the menu. Falls
+/// back to the older ksmserver interface.
+async fn request_logout(conn: &zbus::Connection) -> Result<()> {
+    let shutdown = conn
+        .call_method(
+            Some("org.kde.Shutdown"),
+            "/Shutdown",
+            Some("org.kde.Shutdown"),
+            "logout",
+            &(),
+        )
+        .await;
+    if let Err(e) = shutdown {
+        conn.call_method(
+            Some("org.kde.ksmserver"),
+            "/KSMServer",
+            Some("org.kde.KSMServerInterface"),
+            "logout",
+            &(0i32, 0i32, 0i32),
+        )
+        .await
+        .with_context(|| format!("org.kde.Shutdown.logout failed ({e}); ksmserver too"))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- main ----
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    let cfg = Config::load(&config::path())?;
+
+    let (idle_tx, mut idle_rx) = watch::channel(false);
+    let timeout = Duration::from_secs(cfg.idle_timeout_secs);
+    let input_only = cfg.input_idle_only;
+    std::thread::spawn(move || {
+        if let Err(e) = watch_idle(timeout, input_only, idle_tx) {
+            // Without idle detection the user is simply always "active".
+            eprintln!("idle detection unavailable: {e:#}");
+        }
+    });
+
+    let system = daemon_bus().await.context("connecting to the system bus")?;
+    let daemon = DaemonProxy::new(&system).await?;
+    let session = zbus::Connection::session()
+        .await
+        .context("connecting to the session bus")?;
+    // Don't fail if the tray host isn't up yet (plasmashell starting or
+    // restarting); ksni registers whenever it appears. Heartbeats matter more.
+    let tray = match Tray::default().assume_sni_available(true).spawn().await {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            eprintln!("tray icon unavailable: {e}");
+            None
+        }
+    };
+    let grace = Duration::from_secs(cfg.logout_grace_secs);
+    let mut warnings = Warnings {
+        grace_secs: cfg.logout_grace_secs,
+        ..Default::default()
+    };
+    // When we first saw "no time left", and whether we've asked for logout.
+    let mut out_since: Option<Instant> = None;
+    let mut logout_requested = false;
+
+    loop {
+        let idle = *idle_rx.borrow_and_update();
+        if let Err(e) = daemon.heartbeat(idle).await {
+            eprintln!("heartbeat: {e}");
+        }
+        let status = match daemon.status("").await {
+            Ok(json) => serde_json::from_str::<Status>(&json).ok(),
+            Err(e) => {
+                eprintln!("status: {e}");
+                None
+            }
+        };
+        if let Some(st) = &status
+            && let Some((summary, body, critical)) = warnings.due(st)
+            && let Err(e) = notify(&session, &summary, &body, critical).await
+        {
+            eprintln!("notify: {e:#}");
+        }
+        match &status {
+            Some(st) if !st.allowed_now => {
+                let since = *out_since.get_or_insert_with(Instant::now);
+                if !logout_requested && since.elapsed() >= grace {
+                    logout_requested = true;
+                    eprintln!("time is up; logging out");
+                    if let Err(e) = request_logout(&session).await {
+                        eprintln!("logout: {e:#}");
+                    }
+                }
+            }
+            Some(_) => {
+                out_since = None;
+                logout_requested = false;
+            }
+            // Daemon unreachable: don't act on stale information.
+            None => {}
+        }
+        if let Some(tray) = &tray {
+            tray.update(|t| t.status = status).await;
+        }
+
+        // Next poll, or sooner when the idle state flips or logout is due.
+        let wait = match out_since {
+            Some(since) if !logout_requested => grace.saturating_sub(since.elapsed()).min(POLL),
+            _ => POLL,
+        };
+        let _ = tokio::time::timeout(wait, idle_rx.changed()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(remaining_min: u64, allowed: bool) -> Status {
+        Status {
+            allowed_now: allowed,
+            remaining_secs: remaining_min * 60,
+            used_secs: 0,
+            limit_secs: 120 * 60,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn warns_once_per_threshold() {
+        let mut w = Warnings::default();
+        assert!(w.due(&st(30, true)).is_none());
+        assert!(w.due(&st(10, true)).unwrap().0.starts_with("10 minutes"));
+        assert!(w.due(&st(9, true)).is_none());
+        assert!(w.due(&st(5, true)).unwrap().0.starts_with("5 minutes"));
+        let one = w.due(&st(1, true)).unwrap();
+        assert!(one.0.starts_with("1 minute ") && one.2);
+        assert!(w.due(&st(0, false)).unwrap().0.contains("up"));
+        assert!(w.due(&st(0, false)).is_none());
+    }
+
+    #[test]
+    fn jumping_straight_to_low_time_sends_one_warning() {
+        let mut w = Warnings::default();
+        assert!(w.due(&st(3, true)).unwrap().0.starts_with("3 minutes"));
+        assert!(w.due(&st(3, true)).is_none());
+        assert!(w.due(&st(1, true)).unwrap().0.starts_with("1 minute"));
+    }
+
+    #[test]
+    fn bonus_rearms_warnings() {
+        let mut w = Warnings::default();
+        w.due(&st(10, true));
+        w.due(&st(30, true)); // bonus added
+        assert!(w.due(&st(10, true)).is_some());
+    }
+}

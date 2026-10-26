@@ -1,0 +1,191 @@
+# NixOS module for screentime: the system daemon, the per-session agent
+# (idle tracking + tray countdown), and the PAM check that refuses logins
+# when there's no time left.
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+
+let
+  cfg = config.services.screentime;
+  inherit (lib) mkOption types;
+
+  dayNames = [
+    "mon"
+    "tue"
+    "wed"
+    "thu"
+    "fri"
+    "sat"
+    "sun"
+  ];
+
+  dayType = types.submodule {
+    options = {
+      windows = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "09:00-12:00"
+          "14:00-20:00"
+        ];
+        description = "Allowed time windows, HH:MM-HH:MM (end exclusive, 24:00 allowed).";
+      };
+      limitMinutes = mkOption {
+        type = types.ints.unsigned;
+        default = 0;
+        description = "Screen time allowed on this day, in minutes.";
+      };
+    };
+  };
+
+  settings = {
+    idle_timeout_secs = cfg.idleMinutes * 60;
+    input_idle_only = cfg.inputIdleOnly;
+    logout_grace_secs = cfg.logoutGraceSeconds;
+    force_logout_secs = cfg.forceLogoutSeconds;
+    agent_path = "${cfg.package}/bin/screentime-agent";
+    users = lib.mapAttrs (_: user: {
+      days = lib.mapAttrs (_: day: {
+        inherit (day) windows;
+        limit_minutes = day.limitMinutes;
+      }) user.days;
+    }) cfg.users;
+  };
+
+  # Validated at build time: bad windows fail the rebuild, not the daemon.
+  configFile =
+    pkgs.runCommand "screentime.toml"
+      {
+        raw = (pkgs.formats.toml { }).generate "screentime-raw.toml" settings;
+      }
+      ''
+        ${cfg.package}/bin/screentimed --check "$raw"
+        cp "$raw" "$out"
+      '';
+in
+
+{
+  options.services.screentime = {
+    enable = lib.mkEnableOption "screen-time limits";
+
+    package = mkOption {
+      type = types.package;
+      default = pkgs.callPackage ./package.nix { };
+      description = "The screentime package.";
+    };
+
+    idleMinutes = mkOption {
+      type = types.ints.positive;
+      default = 5;
+      description = "Minutes without keyboard/mouse input after which the counter stops.";
+    };
+
+    inputIdleOnly = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Only real input counts as activity. When false, apps that inhibit
+        idle (video players, games) keep the counter running without input.
+      '';
+    };
+
+    logoutGraceSeconds = mkOption {
+      type = types.ints.unsigned;
+      default = 30;
+      description = "Seconds between running out of time and the (clean) Plasma logout.";
+    };
+
+    forceLogoutSeconds = mkOption {
+      type = types.ints.positive;
+      default = 20;
+      description = ''
+        If the user is still logged in this long after the grace period (agent
+        killed, logout cancelled by an app), terminate their sessions.
+      '';
+    };
+
+    users = mkOption {
+      type = types.attrsOf (
+        types.submodule {
+          options.days = mkOption {
+            type = types.attrsOf dayType;
+            default = { };
+            description = "Per-day rules keyed mon..sun. Missing days aren't allowed.";
+          };
+        }
+      );
+      default = { };
+      description = "Users whose screen time is limited.";
+    };
+
+    pamServices = mkOption {
+      type = types.listOf types.str;
+      # On NixOS sddm's account stack is `include login`, so this covers
+      # graphical and TTY logins alike.
+      default = [ "login" ];
+      description = "PAM services that refuse logins for users without time left.";
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    assertions = lib.mapAttrsToList (name: user: {
+      assertion = lib.all (d: lib.elem d dayNames) (lib.attrNames user.days);
+      message = "services.screentime.users.${name}.days: day names must be one of ${lib.concatStringsSep ", " dayNames}";
+    }) cfg.users;
+
+    environment.etc."screentime/config.toml".source = configFile;
+    environment.systemPackages = [ cfg.package ];
+    services.dbus.packages = [ cfg.package ];
+
+    systemd.services.screentimed = {
+      description = "Screen-time limits";
+      wantedBy = [ "multi-user.target" ];
+      after = [
+        "dbus.service"
+        "systemd-logind.service"
+      ];
+      restartTriggers = [ configFile ];
+      serviceConfig = {
+        Type = "dbus";
+        BusName = "org.screentime.Daemon1";
+        ExecStart = "${cfg.package}/bin/screentimed";
+        Restart = "always";
+        RestartSec = 2;
+        StateDirectory = "screentime";
+      };
+    };
+
+    # Runs in each managed user's desktop session. Stopping it doesn't help:
+    # without heartbeats the daemon counts the user as active.
+    systemd.user.services.screentime-agent = {
+      description = "Screen-time tray countdown and idle tracking";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      unitConfig.ConditionUser = map (u: "|${u}") (lib.attrNames cfg.users);
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/screentime-agent";
+        Restart = "always";
+        RestartSec = 5;
+      };
+    };
+
+    security.pam.services = lib.genAttrs cfg.pamServices (service: {
+      rules.account.screentime = {
+        control = "required";
+        modulePath = "${pkgs.pam}/lib/security/pam_exec.so";
+        args = [
+          "quiet"
+          "stdout"
+          "${cfg.package}/bin/screentime"
+          "pam-check"
+        ];
+        # First in the stack, ahead of any `sufficient` rules that could skip it
+        order = 10000;
+      };
+    });
+  };
+}
