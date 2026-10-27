@@ -37,8 +37,9 @@ and hard-won lessons that aren't obvious from the code.
   SDDM. Fix: the agent asks Plasma to log out cleanly via
   `org.kde.Shutdown.logout` (fallback `org.kde.ksmserver`), and the daemon's
   `TerminateUser` is only a last resort after `logout_grace_secs +
-  force_logout_secs`. Keep that order. The same order applies to the
-  `time_up_action` modes (default `shutdown`): agent asks Plasma
+  force_logout_secs`. Keep that order. The same order applies to every
+  time-up action (`limit_action`, default `logout`; `window_end_action`,
+  default `shutdown`; chosen by `Status.cutoff`): agent asks Plasma
   (`logoutAndShutdown`, or ScreenSaver `Lock`), daemon falls back to logind
   `PowerOffWithFlags(SKIP_INHIBITORS)` (the kid may hold inhibitor locks) or
   `Session.Lock`.

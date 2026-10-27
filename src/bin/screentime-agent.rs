@@ -6,7 +6,8 @@
 //! - Sends desktop notifications as time runs low.
 //! - When time is up, logs out or shuts down through Plasma (like the Log
 //!   Out / Shut Down buttons), so KWin exits cleanly instead of being killed,
-//!   or locks the screen, depending on `time_up_action`. The daemon only
+//!   or locks the screen: `limit_action` when the day's minutes run out,
+//!   `window_end_action` when the allowed window ends. The daemon only
 //!   does it the hard way if that didn't happen.
 //!
 //! If anything here fails, the daemon simply stops hearing "idle" and keeps
@@ -29,7 +30,7 @@ use zbus::zvariant::Value;
 
 use screentime::config::{self, Config, TimeUpAction};
 use screentime::dbus::{DaemonProxy, NotificationsProxy, daemon_bus};
-use screentime::{Status, duration, icon};
+use screentime::{Cutoff, Status, duration, icon};
 
 const POLL: Duration = Duration::from_secs(10);
 const WARN_MINUTES: [u64; 3] = [10, 5, 1];
@@ -217,30 +218,49 @@ impl ksni::Tray for Tray {
 
 // ------------------------------------------------------- notifications ----
 
-#[derive(Default)]
 struct Warnings {
-    /// What happens and how many seconds after running out, for the message.
-    action: TimeUpAction,
+    limit_action: TimeUpAction,
+    window_end_action: TimeUpAction,
+    /// Seconds between running out and the action, for the message.
     grace_secs: u64,
     sent: BTreeSet<u64>,
-    out_sent: bool,
+    /// The time-up action we've already announced.
+    out_sent: Option<TimeUpAction>,
 }
 
 impl Warnings {
+    fn new(cfg: &Config) -> Self {
+        Warnings {
+            limit_action: cfg.limit_action,
+            window_end_action: cfg.window_end_action,
+            grace_secs: cfg.logout_grace_secs,
+            sent: BTreeSet::new(),
+            out_sent: None,
+        }
+    }
+
+    fn action(&self, cutoff: Cutoff) -> TimeUpAction {
+        match cutoff {
+            Cutoff::Limit => self.limit_action,
+            Cutoff::Window => self.window_end_action,
+        }
+    }
+
     /// The notification due for this status, if any: (summary, body, critical).
     fn due(&mut self, st: &Status) -> Option<(String, String, bool)> {
         if !st.allowed_now {
-            if self.out_sent {
+            let action = self.action(st.cutoff.unwrap_or(Cutoff::Limit));
+            if self.out_sent == Some(action) {
                 return None;
             }
-            self.out_sent = true;
+            self.out_sent = Some(action);
             let when = match self.grace_secs {
                 0 => "now".to_string(),
                 s => format!("in {s} seconds"),
             };
             return Some((
                 "Screen time is up".into(),
-                match self.action {
+                match action {
                     TimeUpAction::Shutdown => {
                         format!("The computer will shut down {when}. Save your work!")
                     }
@@ -250,7 +270,7 @@ impl Warnings {
                 true,
             ));
         }
-        self.out_sent = false;
+        self.out_sent = None;
         // Forget warnings that no longer apply (e.g. after bonus time).
         self.sent.retain(|m| st.remaining_secs <= m * 60);
         let minute = WARN_MINUTES
@@ -263,14 +283,20 @@ impl Warnings {
             .extend(WARN_MINUTES.iter().filter(|m| **m >= minute));
         let left = st.remaining_secs.div_ceil(60);
         let plural = if left == 1 { "" } else { "s" };
+        let (reason, cutoff) = match &st.window_end {
+            Some(end) if st.remaining_secs < st.limit_secs.saturating_sub(st.used_secs) => {
+                (format!("Allowed time ends at {end}."), Cutoff::Window)
+            }
+            _ => ("Time to start wrapping up.".to_string(), Cutoff::Limit),
+        };
+        let then = match self.action(cutoff) {
+            TimeUpAction::Shutdown => "Then the computer shuts down.",
+            TimeUpAction::Logout => "Then you'll be logged out.",
+            TimeUpAction::Lock => "Then the screen locks.",
+        };
         Some((
             format!("{left} minute{plural} of screen time left"),
-            match &st.window_end {
-                Some(end) if st.remaining_secs < st.limit_secs.saturating_sub(st.used_secs) => {
-                    format!("Allowed time ends at {end}.")
-                }
-                _ => "Time to start wrapping up.".into(),
-            },
+            format!("{reason} {then}"),
             left <= 1,
         ))
     }
@@ -381,14 +407,11 @@ async fn main() -> Result<()> {
         }
     };
     let grace = Duration::from_secs(cfg.logout_grace_secs);
-    let mut warnings = Warnings {
-        action: cfg.time_up_action,
-        grace_secs: cfg.logout_grace_secs,
-        ..Default::default()
-    };
-    // When we first saw "no time left", and whether we've acted on it.
-    let mut out_since: Option<Instant> = None;
-    let mut logout_requested = false;
+    let mut warnings = Warnings::new(&cfg);
+    // When we first saw "no time left" and the action that calls for, and
+    // whether we've taken it.
+    let mut out: Option<(Instant, TimeUpAction)> = None;
+    let mut acted = false;
 
     loop {
         let idle = *idle_rx.borrow_and_update();
@@ -410,18 +433,28 @@ async fn main() -> Result<()> {
         }
         match &status {
             Some(st) if !st.allowed_now => {
-                let since = *out_since.get_or_insert_with(Instant::now);
-                if !logout_requested && since.elapsed() >= grace {
-                    logout_requested = true;
-                    eprintln!("time is up; {:?}", cfg.time_up_action);
-                    if let Err(e) = time_up(&session, cfg.time_up_action).await {
+                let cutoff = st.cutoff.unwrap_or(Cutoff::Limit);
+                let action = warnings.action(cutoff);
+                // A different action (the window ended while locked for the
+                // limit, say) gets its own grace period, like the daemon.
+                let since = match out {
+                    Some((since, pending)) if pending == action => since,
+                    _ => {
+                        acted = false;
+                        out.insert((Instant::now(), action)).0
+                    }
+                };
+                if !acted && since.elapsed() >= grace {
+                    acted = true;
+                    eprintln!("time is up ({cutoff:?}); {action:?}");
+                    if let Err(e) = time_up(&session, action).await {
                         eprintln!("time up: {e:#}");
                     }
                 }
             }
             Some(_) => {
-                out_since = None;
-                logout_requested = false;
+                out = None;
+                acted = false;
             }
             // Daemon unreachable: don't act on stale information.
             None => {}
@@ -431,8 +464,8 @@ async fn main() -> Result<()> {
         }
 
         // Next poll, or sooner when the idle state flips or the action is due.
-        let wait = match out_since {
-            Some(since) if !logout_requested => grace.saturating_sub(since.elapsed()).min(POLL),
+        let wait = match out {
+            Some((since, _)) if !acted => grace.saturating_sub(since.elapsed()).min(POLL),
             _ => POLL,
         };
         let _ = tokio::time::timeout(wait, idle_rx.changed()).await;
@@ -453,23 +486,62 @@ mod tests {
         }
     }
 
+    fn warnings() -> Warnings {
+        Warnings::new(&Config::parse("").unwrap())
+    }
+
+    fn out(cutoff: Cutoff) -> Status {
+        Status {
+            cutoff: Some(cutoff),
+            ..st(0, false)
+        }
+    }
+
     #[test]
     fn warns_once_per_threshold() {
-        let mut w = Warnings::default();
+        let mut w = warnings();
         assert!(w.due(&st(30, true)).is_none());
         assert!(w.due(&st(10, true)).unwrap().0.starts_with("10 minutes"));
         assert!(w.due(&st(9, true)).is_none());
         assert!(w.due(&st(5, true)).unwrap().0.starts_with("5 minutes"));
         let one = w.due(&st(1, true)).unwrap();
         assert!(one.0.starts_with("1 minute ") && one.2);
-        let up = w.due(&st(0, false)).unwrap();
-        assert!(up.0.contains("up") && up.1.contains("shut down"));
-        assert!(w.due(&st(0, false)).is_none());
+        let up = w.due(&out(Cutoff::Limit)).unwrap();
+        assert!(up.0.contains("up") && up.1.contains("logged out"));
+        assert!(w.due(&out(Cutoff::Limit)).is_none());
+    }
+
+    #[test]
+    fn says_what_happens_for_each_cutoff() {
+        let mut w = warnings();
+        // 10 minutes to the window end, more than that left of the limit.
+        let window_soon = Status {
+            window_end: Some("20:00".into()),
+            ..st(10, true)
+        };
+        let body = w.due(&window_soon).unwrap().1;
+        assert!(
+            body.contains("20:00") && body.contains("shuts down"),
+            "{body}"
+        );
+        assert!(w.due(&st(5, true)).unwrap().1.contains("logged out"));
+    }
+
+    #[test]
+    fn window_end_after_limit_announces_again() {
+        // E.g. locked for the limit, then the window ends: a new action.
+        let mut w = Warnings {
+            limit_action: TimeUpAction::Lock,
+            ..warnings()
+        };
+        assert!(w.due(&out(Cutoff::Limit)).unwrap().1.contains("lock"));
+        assert!(w.due(&out(Cutoff::Limit)).is_none());
+        assert!(w.due(&out(Cutoff::Window)).unwrap().1.contains("shut down"));
     }
 
     #[test]
     fn jumping_straight_to_low_time_sends_one_warning() {
-        let mut w = Warnings::default();
+        let mut w = warnings();
         assert!(w.due(&st(3, true)).unwrap().0.starts_with("3 minutes"));
         assert!(w.due(&st(3, true)).is_none());
         assert!(w.due(&st(1, true)).unwrap().0.starts_with("1 minute"));
@@ -477,7 +549,7 @@ mod tests {
 
     #[test]
     fn bonus_rearms_warnings() {
-        let mut w = Warnings::default();
+        let mut w = warnings();
         w.due(&st(10, true));
         w.due(&st(30, true)); // bonus added
         assert!(w.due(&st(10, true)).is_some());

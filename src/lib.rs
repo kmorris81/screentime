@@ -39,4 +39,17 @@ pub struct Status {
     pub ended: bool,
     #[serde(default)]
     pub extended_until: Option<String>,
+    /// Why `allowed_now` is false, if it is.
+    #[serde(default)]
+    pub cutoff: Option<Cutoff>,
+}
+
+/// What ended a user's time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Cutoff {
+    /// Today's minutes are used up, or the admin ended the day.
+    Limit,
+    /// Outside every allowed window.
+    Window,
 }

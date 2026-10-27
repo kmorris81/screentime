@@ -3,8 +3,8 @@
 use anyhow::{Context, Result, bail};
 use chrono::{Datelike, Duration, NaiveDateTime, Timelike};
 
-use crate::Status;
 use crate::state::DayUsage;
+use crate::{Cutoff, Status};
 
 /// `[start, end)` in minutes since midnight. `end` may be 1440 (24:00).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +129,13 @@ impl Schedule {
                 None => 0,
             }
         };
+        let cutoff = if remaining_secs > 0 {
+            None
+        } else if usage.ended || window.is_some() {
+            Some(Cutoff::Limit)
+        } else {
+            Some(Cutoff::Window)
+        };
         Status {
             user: user.to_string(),
             allowed_now: remaining_secs > 0,
@@ -147,6 +154,7 @@ impl Schedule {
             unlimited,
             ended: usage.ended,
             extended_until: usage.extend_until.map(fmt_hhmm),
+            cutoff,
         }
     }
 
@@ -243,6 +251,7 @@ mod tests {
         let st = sched().evaluate("b", at(2026, 10, 26, 10, 0), &u(0, 0));
         assert!(!st.allowed_now);
         assert_eq!(st.remaining_secs, 0);
+        assert_eq!(st.cutoff, Some(Cutoff::Window));
         assert_eq!(st.next_window.as_deref(), Some("today 15:00"));
     }
 
@@ -251,12 +260,21 @@ mod tests {
         let s = sched();
         let st = s.evaluate("b", at(2026, 10, 26, 17, 0), &u(90 * 60, 0));
         assert!(!st.allowed_now);
+        assert_eq!(st.cutoff, Some(Cutoff::Limit));
         let st = s.evaluate("b", at(2026, 10, 26, 17, 0), &u(90 * 60, 15 * 60));
         assert_eq!(st.remaining_secs, 15 * 60);
+        assert_eq!(st.cutoff, None);
         assert_eq!(st.limit_secs, 105 * 60);
         // Negative bonus can't push the limit below zero.
         let st = s.evaluate("b", at(2026, 10, 26, 17, 0), &u(0, -1_000_000));
         assert_eq!(st.limit_secs, 0);
+    }
+
+    #[test]
+    fn window_end_wins_over_used_up_limit() {
+        // Window over at 20:00 and the minutes used up too: the window counts.
+        let st = sched().evaluate("b", at(2026, 10, 26, 20, 0), &u(90 * 60, 0));
+        assert_eq!(st.cutoff, Some(Cutoff::Window));
     }
 
     #[test]
@@ -292,6 +310,7 @@ mod tests {
         };
         let st = sched().evaluate("b", at(2026, 10, 26, 16, 0), &usage);
         assert!(!st.allowed_now && !st.unlimited);
+        assert_eq!(st.cutoff, Some(Cutoff::Limit));
         // Today is over, so the next window is another day.
         assert_eq!(st.next_window.as_deref(), Some("Sat 09:00"));
     }

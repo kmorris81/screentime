@@ -5,8 +5,8 @@
 //! no (or a stale) heartbeat the user counts as active, so killing the agent
 //! never buys extra time. Out of time or outside a window, the agent logs the
 //! user out, shuts down or locks the screen through Plasma after a grace
-//! period (`time_up_action`); if that hasn't happened a bit later, the daemon
-//! does it through logind.
+//! period (`limit_action` / `window_end_action`); if that hasn't happened a
+//! bit later, the daemon does it through logind.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,9 +38,10 @@ struct Heartbeat {
 #[derive(Default)]
 struct Runtime {
     counting: bool,
-    /// When the user ran out of time (or left the window) with sessions open.
-    /// Cleared once enforced, except for `lock`, which repeats.
-    out_since: Option<Instant>,
+    /// When the user ran out of time (or left the window) with sessions
+    /// open, and the action that calls for. Cleared once enforced, except
+    /// for `lock`, which repeats.
+    out: Option<(Instant, TimeUpAction)>,
 }
 
 struct Shared {
@@ -329,7 +330,6 @@ async fn tick(
         let mut guard = shared.lock().await;
         let sh = &mut *guard;
         let now = Local::now().naive_local();
-        let action = sh.cfg.time_up_action;
         let users: Vec<(String, u32)> = sh.uids.iter().map(|(n, u)| (n.clone(), *u)).collect();
         for (user, uid) in users {
             let rt = sh.runtime.entry(user.clone()).or_default();
@@ -338,7 +338,7 @@ async fn tick(
             // refused login never does. The exception: a shutdown that
             // started while logged in must still happen if Plasma ended the
             // session but didn't manage to power off.
-            let shutting_down = action == TimeUpAction::Shutdown && rt.out_since.is_some();
+            let shutting_down = matches!(rt.out, Some((_, TimeUpAction::Shutdown)));
             if user_sessions.is_none() && !shutting_down {
                 *rt = Runtime::default();
                 continue;
@@ -362,26 +362,34 @@ async fn tick(
             let usage = sh.state.peek(&user, now.date());
             let st = sh.cfg.users[&user].evaluate(&user, now, &usage);
             let deadline = Duration::from_secs(sh.cfg.logout_grace_secs + sh.cfg.force_logout_secs);
-            if st.allowed_now {
-                rt.out_since = None;
+            let Some(cutoff) = st.cutoff else {
+                rt.out = None;
                 continue;
-            }
-            if rt.out_since.get_or_insert_with(Instant::now).elapsed() < deadline {
+            };
+            let action = sh.cfg.action(cutoff);
+            // A different action (say the window ends while the screen is
+            // locked for the limit) starts over with its own grace period,
+            // as the agent does.
+            let since = match rt.out {
+                Some((since, pending)) if pending == action => since,
+                _ => rt.out.insert((Instant::now(), action)).0,
+            };
+            if since.elapsed() < deadline {
                 continue;
             }
             match action {
                 TimeUpAction::Logout => {
-                    rt.out_since = None;
+                    rt.out = None;
                     enforce.push(Enforce::Terminate(user, uid));
                 }
-                // Keep out_since: if the user unlocks again, lock again on
+                // Keep `out`: if the user unlocks again, lock again on
                 // the next tick.
                 TimeUpAction::Lock if !unlocked.is_empty() => {
                     enforce.push(Enforce::Lock(user, unlocked));
                 }
                 TimeUpAction::Lock => {}
                 TimeUpAction::Shutdown => {
-                    rt.out_since = None;
+                    rt.out = None;
                     enforce.push(Enforce::PowerOff(user));
                 }
             }

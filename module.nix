@@ -22,6 +22,12 @@ let
     "sun"
   ];
 
+  actionType = types.enum [
+    "shutdown"
+    "logout"
+    "lock"
+  ];
+
   dayType = types.submodule {
     options = {
       windows = mkOption {
@@ -53,7 +59,8 @@ let
     input_idle_only = cfg.inputIdleOnly;
     logout_grace_secs = cfg.logoutGraceSeconds;
     force_logout_secs = cfg.forceLogoutSeconds;
-    time_up_action = cfg.timeUpAction;
+    limit_action = cfg.limitAction;
+    window_end_action = cfg.windowEndAction;
     agent_path = "${cfg.package}/bin/screentime-agent";
     users = lib.mapAttrs (_: user: {
       days = lib.mapAttrs (_: day: {
@@ -76,6 +83,12 @@ let
 in
 
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "services" "screentime" "timeUpAction" ]
+      "Use services.screentime.limitAction (default \"logout\") and windowEndAction (default \"shutdown\")."
+    )
+  ];
+
   options.services.screentime = {
     enable = lib.mkEnableOption "screen-time limits";
 
@@ -109,18 +122,25 @@ in
       '';
     };
 
-    timeUpAction = mkOption {
-      type = types.enum [
-        "shutdown"
-        "logout"
-        "lock"
-      ];
+    limitAction = mkOption {
+      type = actionType;
+      default = "logout";
+      description = ''
+        What happens when a user's minutes for the day run out (or an admin
+        runs `screentime end`): power the machine off, log the user out, or
+        lock the screen (locked again whenever they unlock it). Refused
+        logins afterwards never trigger this.
+      '';
+    };
+
+    windowEndAction = mkOption {
+      type = actionType;
       default = "shutdown";
       description = ''
-        What happens when a user runs out of time or their window ends:
-        power the machine off, log the user out, or lock the screen (it is
-        locked again whenever they unlock it). Refused logins afterwards
-        never trigger this.
+        What happens when a user's allowed window ends while they're logged
+        in; same choices as `limitAction`. If the window ends while an
+        earlier `limitAction` is in effect (e.g. a locked screen), this
+        action follows, with its own grace period.
       '';
     };
 

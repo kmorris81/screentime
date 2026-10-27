@@ -4,9 +4,10 @@ A screen-time enforcement and management application for Linux/KDE/Wayland.
 
 screentime limits when and how long a user (typically a kid's account) can use
 the computer. You set allowed time windows and a daily limit for each day of
-the week. Time only counts while the user is actually active, and once it's
-used up the computer shuts down (or, if configured, logs them out or locks
-the screen) and they can't log back in until their next window.
+the week. Time only counts while the user is actually active. When the minutes
+run out they're logged out, and when the window ends the computer shuts
+down (both configurable), and they can't log back in until their next
+window.
 Everything is configured declaratively through a NixOS module, and an admin
 CLI handles the day-to-day adjustments ("30 more minutes", "no limits today").
 
@@ -39,8 +40,10 @@ Plasma on Wayland:
   the next window starts.
 - **Warnings:** desktop notifications at 10, 5 and 1 minutes left, and when
   time is up.
-- **Enforcement** (`timeUpAction`):
-  - `shutdown` (default): after a grace period (30 s by default) Plasma shuts
+- **Enforcement:** one action for when the day's minutes run out
+  (`limitAction`, default `logout`) and one for when the allowed window ends
+  (`windowEndAction`, default `shutdown`). Each can be:
+  - `shutdown`: after a grace period (30 s by default) Plasma shuts
     the computer down, the same way as the Shut Down button. If the machine
     is still up shortly after that, the daemon powers it off through logind,
     ignoring inhibitor locks.
@@ -50,7 +53,11 @@ Plasma on Wayland:
   - `lock`: after the grace period the screen locks. The session stays open
     but locked time isn't counted. If the user unlocks it, the daemon locks
     it again within a few seconds.
-  - Only a user who is logged in when time runs out triggers the action. A
+  - If both apply (minutes used up and the window over), the window's action
+    wins. If the window ends while the limit's action is still in effect
+    (e.g. a locked screen), the window's action follows with a fresh grace
+    period.
+  - Only a user who is logged in when time runs out triggers an action. A
     refused login later never shuts the computer down.
   - Logins are refused at SDDM and on text consoles until the next window.
 - **Admin overrides for today:** bonus time, no limits for the rest of the
@@ -188,7 +195,8 @@ All options live under `services.screentime`.
 | `users.<name>.days.<day>.limitMinutes` | `0` | Screen time allowed that day. |
 | `idleMinutes` | `5` | Minutes without keyboard/mouse input after which the counter stops. |
 | `inputIdleOnly` | `true` | Only real input counts as activity; idle inhibitors (video, games) are ignored. |
-| `timeUpAction` | `"shutdown"` | What happens when time runs out or the window ends: `"shutdown"`, `"logout"` or `"lock"`. |
+| `limitAction` | `"logout"` | What happens when the day's minutes run out (or after `screentime end`): `"shutdown"`, `"logout"` or `"lock"`. |
+| `windowEndAction` | `"shutdown"` | What happens when the allowed window ends while logged in; same choices. |
 | `logoutGraceSeconds` | `30` | Time between running out and the clean Plasma shutdown, logout or lock. |
 | `forceLogoutSeconds` | `20` | If that hasn't happened this long after the grace period, the daemon does it through logind (power off, terminate sessions, or lock). |
 | `pamServices` | `[ "login" ]` | PAM services that refuse logins without time left. On NixOS, SDDM's account stack includes `login`, so this covers both graphical and console logins. |
@@ -209,7 +217,7 @@ screentime status [USER]            # time left, used/limit, bonus, window, next
 sudo screentime bonus USER 30m      # add time today: 30, 30m, 1h, 1h30m, 90s, -15m
 sudo screentime off USER            # no limits or windows for the rest of today
 sudo screentime extend USER 21:30   # allow use past today's window until 21:30
-sudo screentime end USER            # out of time now (time-up action after the grace period)
+sudo screentime end USER            # out of time now (limitAction after the grace period)
 sudo screentime on USER             # undo off/extend/end for today (bonus stays)
 screentime help
 ```
@@ -287,7 +295,8 @@ session:
 cargo build --bins --examples
 cat > /tmp/st.toml <<EOF
 logout_grace_secs = 5
-time_up_action = "shutdown"   # or "logout", "lock"
+limit_action = "logout"        # minutes used up: "shutdown", "logout" or "lock"
+window_end_action = "shutdown" # outside every window
 agent_path = "$PWD/target/debug/screentime-agent"
 [users.$USER.days.$(date +%a | tr A-Z a-z)]
 windows = ["00:00-24:00"]

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::Cutoff;
 use crate::schedule::{DayRules, Schedule, parse_window};
 
 pub const DEFAULT_PATH: &str = "/etc/screentime/config.toml";
@@ -30,8 +31,10 @@ struct RawConfig {
     logout_grace_secs: u64,
     #[serde(default = "default_force")]
     force_logout_secs: u64,
-    #[serde(default)]
-    time_up_action: TimeUpAction,
+    #[serde(default = "default_limit_action")]
+    limit_action: TimeUpAction,
+    #[serde(default = "default_window_end_action")]
+    window_end_action: TimeUpAction,
     #[serde(default)]
     agent_path: Option<PathBuf>,
     #[serde(default)]
@@ -69,13 +72,18 @@ fn default_grace() -> u64 {
 fn default_force() -> u64 {
     20
 }
+fn default_limit_action() -> TimeUpAction {
+    TimeUpAction::Logout
+}
+fn default_window_end_action() -> TimeUpAction {
+    TimeUpAction::Shutdown
+}
 
 /// What happens once a user is out of time or outside their windows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeUpAction {
     /// Power the machine off.
-    #[default]
     Shutdown,
     /// End the user's session; SDDM comes back.
     Logout,
@@ -99,7 +107,10 @@ pub struct Config {
     /// If that didn't happen this long after the grace period (agent killed,
     /// logout cancelled), the daemon does it through logind.
     pub force_logout_secs: u64,
-    pub time_up_action: TimeUpAction,
+    /// When today's minutes run out (or the admin ends the day).
+    pub limit_action: TimeUpAction,
+    /// When the allowed window ends.
+    pub window_end_action: TimeUpAction,
     /// Heartbeats are only accepted from a process running this executable.
     pub agent_path: Option<PathBuf>,
     pub users: BTreeMap<String, Schedule>,
@@ -108,6 +119,14 @@ pub struct Config {
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 impl Config {
+    /// The action for whatever ended the user's time.
+    pub fn action(&self, cutoff: Cutoff) -> TimeUpAction {
+        match cutoff {
+            Cutoff::Limit => self.limit_action,
+            Cutoff::Window => self.window_end_action,
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -140,7 +159,8 @@ impl Config {
             heartbeat_timeout_secs: raw.heartbeat_timeout_secs,
             logout_grace_secs: raw.logout_grace_secs,
             force_logout_secs: raw.force_logout_secs,
-            time_up_action: raw.time_up_action,
+            limit_action: raw.limit_action,
+            window_end_action: raw.window_end_action,
             agent_path: raw.agent_path,
             users,
         })
@@ -171,14 +191,16 @@ mod tests {
         assert_eq!(s.days[5].windows.len(), 2);
         assert!(s.days[1].windows.is_empty());
         assert!(cfg.input_idle_only);
-        assert_eq!(cfg.time_up_action, TimeUpAction::Shutdown);
+        assert_eq!(cfg.action(Cutoff::Limit), TimeUpAction::Logout);
+        assert_eq!(cfg.action(Cutoff::Window), TimeUpAction::Shutdown);
     }
 
     #[test]
-    fn parses_time_up_action() {
-        let cfg = Config::parse("time_up_action = \"lock\"").unwrap();
-        assert_eq!(cfg.time_up_action, TimeUpAction::Lock);
-        assert!(Config::parse("time_up_action = \"reboot\"").is_err());
+    fn parses_actions() {
+        let cfg = Config::parse("limit_action = \"lock\"\nwindow_end_action = \"logout\"").unwrap();
+        assert_eq!(cfg.action(Cutoff::Limit), TimeUpAction::Lock);
+        assert_eq!(cfg.action(Cutoff::Window), TimeUpAction::Logout);
+        assert!(Config::parse("limit_action = \"reboot\"").is_err());
     }
 
     #[test]
