@@ -31,6 +31,8 @@ struct RawConfig {
     #[serde(default = "default_force")]
     force_logout_secs: u64,
     #[serde(default)]
+    time_up_action: TimeUpAction,
+    #[serde(default)]
     agent_path: Option<PathBuf>,
     #[serde(default)]
     users: BTreeMap<String, RawUser>,
@@ -68,6 +70,20 @@ fn default_force() -> u64 {
     20
 }
 
+/// What happens once a user is out of time or outside their windows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeUpAction {
+    /// Power the machine off.
+    #[default]
+    Shutdown,
+    /// End the user's session; SDDM comes back.
+    Logout,
+    /// Lock the screen. The session stays open, but locked time isn't
+    /// counted, and unlocking it gets it locked again.
+    Lock,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// No keyboard/mouse input for this long stops the counter.
@@ -77,11 +93,13 @@ pub struct Config {
     pub input_idle_only: bool,
     /// No heartbeat from the agent for this long: assume active (fail closed).
     pub heartbeat_timeout_secs: u64,
-    /// Time between running out and the agent's clean Plasma logout.
+    /// Time between running out and the agent's clean Plasma logout,
+    /// shutdown or screen lock.
     pub logout_grace_secs: u64,
-    /// If sessions are still open this long after the grace period (agent
-    /// killed, logout cancelled), the daemon kills them via logind.
+    /// If that didn't happen this long after the grace period (agent killed,
+    /// logout cancelled), the daemon does it through logind.
     pub force_logout_secs: u64,
+    pub time_up_action: TimeUpAction,
     /// Heartbeats are only accepted from a process running this executable.
     pub agent_path: Option<PathBuf>,
     pub users: BTreeMap<String, Schedule>,
@@ -122,6 +140,7 @@ impl Config {
             heartbeat_timeout_secs: raw.heartbeat_timeout_secs,
             logout_grace_secs: raw.logout_grace_secs,
             force_logout_secs: raw.force_logout_secs,
+            time_up_action: raw.time_up_action,
             agent_path: raw.agent_path,
             users,
         })
@@ -152,6 +171,14 @@ mod tests {
         assert_eq!(s.days[5].windows.len(), 2);
         assert!(s.days[1].windows.is_empty());
         assert!(cfg.input_idle_only);
+        assert_eq!(cfg.time_up_action, TimeUpAction::Shutdown);
+    }
+
+    #[test]
+    fn parses_time_up_action() {
+        let cfg = Config::parse("time_up_action = \"lock\"").unwrap();
+        assert_eq!(cfg.time_up_action, TimeUpAction::Lock);
+        assert!(Config::parse("time_up_action = \"reboot\"").is_err());
     }
 
     #[test]

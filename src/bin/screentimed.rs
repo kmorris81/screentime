@@ -4,8 +4,9 @@
 //! session. Time is counted unless that user's agent reports them idle. With
 //! no (or a stale) heartbeat the user counts as active, so killing the agent
 //! never buys extra time. Out of time or outside a window, the agent logs the
-//! user out cleanly after a grace period; if sessions are still open a bit
-//! later, the daemon terminates them through logind.
+//! user out, shuts down or locks the screen through Plasma after a grace
+//! period (`time_up_action`); if that hasn't happened a bit later, the daemon
+//! does it through logind.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,10 +18,11 @@ use chrono::Local;
 use tokio::sync::Mutex;
 use zbus::message::Header;
 use zbus::proxy::CacheProperties;
+use zbus::zvariant::OwnedObjectPath;
 use zbus::{Connection, fdo};
 
-use screentime::config::{self, Config};
-use screentime::dbus::{LoginManagerProxy, LoginSessionProxy};
+use screentime::config::{self, Config, TimeUpAction};
+use screentime::dbus::{LoginManagerProxy, LoginSessionProxy, SKIP_INHIBITORS};
 use screentime::schedule::{fmt_hhmm, parse_hhmm};
 use screentime::state::{self, DayUsage, State};
 use screentime::{BUS_NAME, OBJECT_PATH, Status, duration};
@@ -37,6 +39,7 @@ struct Heartbeat {
 struct Runtime {
     counting: bool,
     /// When the user ran out of time (or left the window) with sessions open.
+    /// Cleared once enforced, except for `lock`, which repeats.
     out_since: Option<Instant>,
 }
 
@@ -271,16 +274,24 @@ fn lookup_uids(users: impl Iterator<Item = String>) -> Result<HashMap<String, u3
     Ok(out)
 }
 
-/// For each uid: does it have any session at all, and is one of them in the
-/// foreground and unlocked?
+/// One managed user's sessions, as seen by logind.
+#[derive(Default)]
+struct UserSessions {
+    /// One of them is in the foreground and unlocked.
+    foreground: bool,
+    /// Sessions that aren't locked.
+    unlocked: Vec<OwnedObjectPath>,
+}
+
+/// Sessions per uid; a uid with no sessions is missing.
 async fn session_states(
     conn: &Connection,
     login: &LoginManagerProxy<'_>,
-) -> Result<HashMap<u32, bool>> {
-    let mut out = HashMap::new();
+) -> Result<HashMap<u32, UserSessions>> {
+    let mut out: HashMap<u32, UserSessions> = HashMap::new();
     for (_id, uid, _user, _seat, path) in login.list_sessions().await? {
         let session = LoginSessionProxy::builder(conn)
-            .path(path)?
+            .path(path.clone())?
             .cache_properties(CacheProperties::No)
             .build()
             .await?;
@@ -289,11 +300,21 @@ async fn session_states(
         if !class.starts_with("user") {
             continue;
         }
-        let foreground = session.active().await.unwrap_or(false)
-            && !session.locked_hint().await.unwrap_or(false);
-        *out.entry(uid).or_insert(false) |= foreground;
+        let locked = session.locked_hint().await.unwrap_or(false);
+        let entry = out.entry(uid).or_default();
+        entry.foreground |= session.active().await.unwrap_or(false) && !locked;
+        if !locked {
+            entry.unlocked.push(path);
+        }
     }
     Ok(out)
+}
+
+/// Last-resort enforcement once the agent's clean action hasn't worked.
+enum Enforce {
+    Terminate(String, u32),
+    Lock(String, Vec<OwnedObjectPath>),
+    PowerOff(String),
 }
 
 async fn tick(
@@ -302,24 +323,37 @@ async fn tick(
     login: &LoginManagerProxy<'_>,
     elapsed: Duration,
 ) -> Result<()> {
-    let sessions = session_states(conn, login).await?;
-    let mut to_terminate = Vec::new();
+    let mut sessions = session_states(conn, login).await?;
+    let mut enforce = Vec::new();
     {
         let mut guard = shared.lock().await;
         let sh = &mut *guard;
         let now = Local::now().naive_local();
+        let action = sh.cfg.time_up_action;
         let users: Vec<(String, u32)> = sh.uids.iter().map(|(n, u)| (n.clone(), *u)).collect();
         for (user, uid) in users {
-            let Some(&foreground) = sessions.get(&uid) else {
-                sh.runtime.insert(user, Runtime::default());
+            let rt = sh.runtime.entry(user.clone()).or_default();
+            let user_sessions = sessions.remove(&uid);
+            // Only a user with sessions open can trigger enforcement, so a
+            // refused login never does. The exception: a shutdown that
+            // started while logged in must still happen if Plasma ended the
+            // session but didn't manage to power off.
+            let shutting_down = action == TimeUpAction::Shutdown && rt.out_since.is_some();
+            if user_sessions.is_none() && !shutting_down {
+                *rt = Runtime::default();
                 continue;
-            };
+            }
+            let UserSessions {
+                foreground,
+                unlocked,
+            } = user_sessions.unwrap_or_default();
             let hb_timeout = Duration::from_secs(sh.cfg.heartbeat_timeout_secs);
             let idle = sh
                 .heartbeats
                 .get(&uid)
                 .is_some_and(|hb| hb.idle && hb.at.elapsed() < hb_timeout);
             let counting = foreground && !idle;
+            rt.counting = counting;
             if counting {
                 sh.state.today(&user, now.date()).used_secs += elapsed.as_secs_f64().round() as u64;
                 sh.dirty = true;
@@ -328,20 +362,65 @@ async fn tick(
             let usage = sh.state.peek(&user, now.date());
             let st = sh.cfg.users[&user].evaluate(&user, now, &usage);
             let deadline = Duration::from_secs(sh.cfg.logout_grace_secs + sh.cfg.force_logout_secs);
-            let rt = sh.runtime.entry(user.clone()).or_default();
-            rt.counting = counting;
             if st.allowed_now {
                 rt.out_since = None;
-            } else if rt.out_since.get_or_insert_with(Instant::now).elapsed() >= deadline {
-                rt.out_since = None;
-                to_terminate.push((user, uid));
+                continue;
+            }
+            if rt.out_since.get_or_insert_with(Instant::now).elapsed() < deadline {
+                continue;
+            }
+            match action {
+                TimeUpAction::Logout => {
+                    rt.out_since = None;
+                    enforce.push(Enforce::Terminate(user, uid));
+                }
+                // Keep out_since: if the user unlocks again, lock again on
+                // the next tick.
+                TimeUpAction::Lock if !unlocked.is_empty() => {
+                    enforce.push(Enforce::Lock(user, unlocked));
+                }
+                TimeUpAction::Lock => {}
+                TimeUpAction::Shutdown => {
+                    rt.out_since = None;
+                    enforce.push(Enforce::PowerOff(user));
+                }
             }
         }
     }
-    for (user, uid) in to_terminate {
-        eprintln!("{user}: still logged in after time ran out; terminating sessions");
-        if let Err(e) = login.terminate_user(uid).await {
-            eprintln!("{user}: terminate failed: {e}");
+    for e in enforce {
+        match e {
+            Enforce::Terminate(user, uid) => {
+                eprintln!("{user}: still logged in after time ran out; terminating sessions");
+                if let Err(e) = login.terminate_user(uid).await {
+                    eprintln!("{user}: terminate failed: {e}");
+                }
+            }
+            Enforce::Lock(user, paths) => {
+                eprintln!("{user}: unlocked after time ran out; locking");
+                for path in paths {
+                    let locked = async {
+                        LoginSessionProxy::builder(conn)
+                            .path(path)?
+                            .build()
+                            .await?
+                            .lock()
+                            .await
+                    };
+                    if let Err(e) = locked.await {
+                        eprintln!("{user}: lock failed: {e}");
+                    }
+                }
+            }
+            Enforce::PowerOff(user) => {
+                eprintln!("{user}: time ran out and the machine is still up; powering off");
+                if let Err(e) = login.power_off_with_flags(SKIP_INHIBITORS).await {
+                    eprintln!("PowerOffWithFlags failed ({e}); trying PowerOff");
+                    if let Err(e) = login.power_off(false).await {
+                        eprintln!("power off failed: {e}");
+                    }
+                }
+                break;
+            }
         }
     }
     Ok(())

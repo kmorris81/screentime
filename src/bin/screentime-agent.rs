@@ -4,9 +4,10 @@
 //!   protocol and reports it to screentimed in periodic heartbeats.
 //! - Shows the time left as a tray icon (StatusNotifierItem).
 //! - Sends desktop notifications as time runs low.
-//! - When time is up, logs out through Plasma (like the Log Out button), so
-//!   KWin shuts down cleanly and SDDM comes back. The daemon only kills the
-//!   session itself if that didn't happen.
+//! - When time is up, logs out or shuts down through Plasma (like the Log
+//!   Out / Shut Down buttons), so KWin exits cleanly instead of being killed,
+//!   or locks the screen, depending on `time_up_action`. The daemon only
+//!   does it the hard way if that didn't happen.
 //!
 //! If anything here fails, the daemon simply stops hearing "idle" and keeps
 //! counting, so the agent can't be used to dodge the limit.
@@ -26,7 +27,7 @@ use wayland_protocols::ext::idle_notify::v1::client::{
 };
 use zbus::zvariant::Value;
 
-use screentime::config::{self, Config};
+use screentime::config::{self, Config, TimeUpAction};
 use screentime::dbus::{DaemonProxy, NotificationsProxy, daemon_bus};
 use screentime::{Status, duration, icon};
 
@@ -218,7 +219,8 @@ impl ksni::Tray for Tray {
 
 #[derive(Default)]
 struct Warnings {
-    /// Seconds between running out and the logout, for the message.
+    /// What happens and how many seconds after running out, for the message.
+    action: TimeUpAction,
     grace_secs: u64,
     sent: BTreeSet<u64>,
     out_sent: bool,
@@ -238,7 +240,13 @@ impl Warnings {
             };
             return Some((
                 "Screen time is up".into(),
-                format!("You'll be logged out {when}. Save your work!"),
+                match self.action {
+                    TimeUpAction::Shutdown => {
+                        format!("The computer will shut down {when}. Save your work!")
+                    }
+                    TimeUpAction::Logout => format!("You'll be logged out {when}. Save your work!"),
+                    TimeUpAction::Lock => format!("The screen will lock {when}."),
+                },
                 true,
             ));
         }
@@ -287,30 +295,59 @@ async fn notify(conn: &zbus::Connection, summary: &str, body: &str, critical: bo
     Ok(())
 }
 
-/// Ask Plasma to end the session, the same as Log Out in the menu. Falls
-/// back to the older ksmserver interface.
-async fn request_logout(conn: &zbus::Connection) -> Result<()> {
-    let shutdown = conn
+/// Ask Plasma to end the session, the same as Log Out (or Shut Down) in the
+/// menu. Falls back to the older ksmserver interface.
+async fn request_logout(conn: &zbus::Connection, shutdown: bool) -> Result<()> {
+    let method = if shutdown {
+        "logoutAndShutdown"
+    } else {
+        "logout"
+    };
+    let plasma = conn
         .call_method(
             Some("org.kde.Shutdown"),
             "/Shutdown",
             Some("org.kde.Shutdown"),
-            "logout",
+            method,
             &(),
         )
         .await;
-    if let Err(e) = shutdown {
+    if let Err(e) = plasma {
+        // logout(confirm = no, type = halt or none, mode = default)
+        let sdtype = if shutdown { 2i32 } else { 0i32 };
         conn.call_method(
             Some("org.kde.ksmserver"),
             "/KSMServer",
             Some("org.kde.KSMServerInterface"),
             "logout",
-            &(0i32, 0i32, 0i32),
+            &(0i32, sdtype, 0i32),
         )
         .await
-        .with_context(|| format!("org.kde.Shutdown.logout failed ({e}); ksmserver too"))?;
+        .with_context(|| format!("org.kde.Shutdown.{method} failed ({e}); ksmserver too"))?;
     }
     Ok(())
+}
+
+/// Lock the screen through the desktop's screensaver interface.
+async fn request_lock(conn: &zbus::Connection) -> Result<()> {
+    conn.call_method(
+        Some("org.freedesktop.ScreenSaver"),
+        "/ScreenSaver",
+        Some("org.freedesktop.ScreenSaver"),
+        "Lock",
+        &(),
+    )
+    .await
+    .context("org.freedesktop.ScreenSaver.Lock")?;
+    Ok(())
+}
+
+async fn time_up(conn: &zbus::Connection, action: TimeUpAction) -> Result<()> {
+    match action {
+        TimeUpAction::Shutdown => request_logout(conn, true).await,
+        TimeUpAction::Logout => request_logout(conn, false).await,
+        TimeUpAction::Lock => request_lock(conn).await,
+    }
 }
 
 // ---------------------------------------------------------------- main ----
@@ -345,10 +382,11 @@ async fn main() -> Result<()> {
     };
     let grace = Duration::from_secs(cfg.logout_grace_secs);
     let mut warnings = Warnings {
+        action: cfg.time_up_action,
         grace_secs: cfg.logout_grace_secs,
         ..Default::default()
     };
-    // When we first saw "no time left", and whether we've asked for logout.
+    // When we first saw "no time left", and whether we've acted on it.
     let mut out_since: Option<Instant> = None;
     let mut logout_requested = false;
 
@@ -375,9 +413,9 @@ async fn main() -> Result<()> {
                 let since = *out_since.get_or_insert_with(Instant::now);
                 if !logout_requested && since.elapsed() >= grace {
                     logout_requested = true;
-                    eprintln!("time is up; logging out");
-                    if let Err(e) = request_logout(&session).await {
-                        eprintln!("logout: {e:#}");
+                    eprintln!("time is up; {:?}", cfg.time_up_action);
+                    if let Err(e) = time_up(&session, cfg.time_up_action).await {
+                        eprintln!("time up: {e:#}");
                     }
                 }
             }
@@ -392,7 +430,7 @@ async fn main() -> Result<()> {
             tray.update(|t| t.status = status).await;
         }
 
-        // Next poll, or sooner when the idle state flips or logout is due.
+        // Next poll, or sooner when the idle state flips or the action is due.
         let wait = match out_since {
             Some(since) if !logout_requested => grace.saturating_sub(since.elapsed()).min(POLL),
             _ => POLL,
@@ -424,7 +462,8 @@ mod tests {
         assert!(w.due(&st(5, true)).unwrap().0.starts_with("5 minutes"));
         let one = w.due(&st(1, true)).unwrap();
         assert!(one.0.starts_with("1 minute ") && one.2);
-        assert!(w.due(&st(0, false)).unwrap().0.contains("up"));
+        let up = w.due(&st(0, false)).unwrap();
+        assert!(up.0.contains("up") && up.1.contains("shut down"));
         assert!(w.due(&st(0, false)).is_none());
     }
 

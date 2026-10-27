@@ -23,7 +23,7 @@ usage:
   screentime off USER               no limits or windows for the rest of today
   screentime on USER                undo off/extend/end for today (bonus stays)
   screentime extend USER HH:MM      allow use past today's window until HH:MM
-  screentime end USER               out of time now (logged out after grace)
+  screentime end USER               out of time now (time-up action after grace)
   screentime pam-check              PAM account check (uses $PAM_USER)
 
 Everything except status needs root. Overrides reset at midnight.";

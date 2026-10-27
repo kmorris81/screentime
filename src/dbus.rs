@@ -45,7 +45,15 @@ pub trait LoginManager {
     #[allow(clippy::type_complexity)]
     fn list_sessions(&self) -> zbus::Result<Vec<(String, u32, String, String, OwnedObjectPath)>>;
     fn terminate_user(&self, uid: u32) -> zbus::Result<()>;
+    fn power_off(&self, interactive: bool) -> zbus::Result<()>;
+    /// systemd >= 248; see `SKIP_INHIBITORS`.
+    fn power_off_with_flags(&self, flags: u64) -> zbus::Result<()>;
 }
+
+/// `PowerOffWithFlags` flag (systemd >= 256): ignore block inhibitors, which
+/// newer logind otherwise enforces even for root. The managed user may be
+/// allowed to take inhibitor locks, so they mustn't be able to stop this.
+pub const SKIP_INHIBITORS: u64 = 1 << 4;
 
 #[zbus::proxy(
     interface = "org.freedesktop.login1.Session",
@@ -58,6 +66,7 @@ pub trait LoginSession {
     fn locked_hint(&self) -> zbus::Result<bool>;
     #[zbus(property)]
     fn class(&self) -> zbus::Result<String>;
+    fn lock(&self) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(

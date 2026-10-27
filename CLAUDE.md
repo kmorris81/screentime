@@ -37,7 +37,14 @@ and hard-won lessons that aren't obvious from the code.
   SDDM. Fix: the agent asks Plasma to log out cleanly via
   `org.kde.Shutdown.logout` (fallback `org.kde.ksmserver`), and the daemon's
   `TerminateUser` is only a last resort after `logout_grace_secs +
-  force_logout_secs`. Keep that order.
+  force_logout_secs`. Keep that order. The same order applies to the
+  `time_up_action` modes (default `shutdown`): agent asks Plasma
+  (`logoutAndShutdown`, or ScreenSaver `Lock`), daemon falls back to logind
+  `PowerOffWithFlags(SKIP_INHIBITORS)` (the kid may hold inhibitor locks) or
+  `Session.Lock`.
+- **Never shut down on a refused login.** The daemon only enforces for users
+  with a session open when time ran out; a pending shutdown survives the
+  session ending (Plasma logged out but didn't power off), nothing else does.
 - **Screen locking is not idle detection.** The predecessor (timekpr-nExT)
   only noticed idleness once the screen locked, and locking on KDE was the
   original pain. We use Wayland `ext-idle-notify-v1`; v2's

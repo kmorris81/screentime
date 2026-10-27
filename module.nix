@@ -46,6 +46,7 @@ let
     input_idle_only = cfg.inputIdleOnly;
     logout_grace_secs = cfg.logoutGraceSeconds;
     force_logout_secs = cfg.forceLogoutSeconds;
+    time_up_action = cfg.timeUpAction;
     agent_path = "${cfg.package}/bin/screentime-agent";
     users = lib.mapAttrs (_: user: {
       days = lib.mapAttrs (_: day: {
@@ -92,18 +93,34 @@ in
       '';
     };
 
+    timeUpAction = mkOption {
+      type = types.enum [
+        "shutdown"
+        "logout"
+        "lock"
+      ];
+      default = "shutdown";
+      description = ''
+        What happens when a user runs out of time or their window ends:
+        power the machine off, log the user out, or lock the screen (it is
+        locked again whenever they unlock it). Refused logins afterwards
+        never trigger this.
+      '';
+    };
+
     logoutGraceSeconds = mkOption {
       type = types.ints.unsigned;
       default = 30;
-      description = "Seconds between running out of time and the (clean) Plasma logout.";
+      description = "Seconds between running out of time and the clean Plasma logout, shutdown or lock.";
     };
 
     forceLogoutSeconds = mkOption {
       type = types.ints.positive;
       default = 20;
       description = ''
-        If the user is still logged in this long after the grace period (agent
-        killed, logout cancelled by an app), terminate their sessions.
+        If that hasn't happened this long after the grace period (agent
+        killed, logout cancelled by an app), the daemon does it through
+        logind: terminates the sessions, powers off, or locks the sessions.
       '';
     };
 
