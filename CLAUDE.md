@@ -76,6 +76,12 @@ and hard-won lessons that aren't obvious from the code.
 
 - `cargo build`, `cargo test`, `cargo clippy --all-targets`. `package.nix`
   runs the tests in its check phase.
+- Releases: tag `vX.Y.Z` matching `Cargo.toml`; CI builds static musl
+  binaries and commits `release.json`, which the module uses only when its
+  version equals `Cargo.toml`'s. Bump the version with any code change:
+  otherwise release.json still matches and the new `module.nix` installs the
+  old binaries. (Bumped but not yet released builds from source.)
+  The CI commit lands on master; pull before pushing again.
 - End-to-end testing without a desktop: see "End-to-end testing" in README.md
   (`examples/fake_logind.rs` on a private session bus with
   `SCREENTIME_BUS=session`).

@@ -41,6 +41,13 @@ let
     };
   };
 
+  # Use the GitHub release binaries only if release.json describes this
+  # very version; between a version bump and its release, build from source.
+  prebuiltAvailable =
+    builtins.pathExists ./release.json
+    && (lib.importJSON ./release.json).version == (lib.importTOML ./Cargo.toml).package.version
+    && pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+
   settings = {
     idle_timeout_secs = cfg.idleMinutes * 60;
     input_idle_only = cfg.inputIdleOnly;
@@ -74,8 +81,17 @@ in
 
     package = mkOption {
       type = types.package;
-      default = pkgs.callPackage ./package.nix { };
-      description = "The screentime package.";
+      default =
+        if prebuiltAvailable then
+          pkgs.callPackage ./package-bin.nix { }
+        else
+          pkgs.callPackage ./package.nix { };
+      defaultText = lib.literalMD "the prebuilt release binaries when they match this version, else built from source";
+      description = ''
+        The screentime package. Set it to
+        `pkgs.callPackage "''${inputs.screentime}/package.nix" { }` to always
+        build from source.
+      '';
     };
 
     idleMinutes = mkOption {

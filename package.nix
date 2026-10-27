@@ -5,7 +5,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "screentime";
-  version = "0.1.0";
+  inherit ((lib.importTOML ./Cargo.toml).package) version;
 
   # Only the files cargo needs, so a local target/ never ends up in the build
   src = lib.fileset.toSource {

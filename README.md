@@ -156,6 +156,27 @@ added as a submodule).
 Rebuild, then check `systemctl status screentimed`. The agent starts with the
 managed user's next graphical login.
 
+### Prebuilt binaries
+
+The module doesn't compile anything when `release.json` describes the
+version in `Cargo.toml`. It then installs the static x86_64 binaries from that
+GitHub release (`package-bin.nix`). Otherwise, e.g. between a version bump
+and its release, it builds from source (`package.nix`). To always build from
+source, set `services.screentime.package = pkgs.callPackage "${src}/package.nix" { };`.
+
+To cut a release:
+
+```sh
+# bump version in Cargo.toml (cargo build updates Cargo.lock), then
+git commit -am "v0.2.0" && git tag v0.2.0 && git push && git push --tags
+```
+
+`.github/workflows/release.yml` then runs the tests, builds static musl
+binaries, publishes `screentime-0.2.0-x86_64-linux.tar.gz` as a GitHub
+release, and commits the updated `release.json` to master. Wait for that
+commit before updating the system's input (`nix flake update screentime`),
+and `git pull` it locally before your next push.
+
 ### Options
 
 All options live under `services.screentime`.
@@ -171,7 +192,7 @@ All options live under `services.screentime`.
 | `logoutGraceSeconds` | `30` | Time between running out and the clean Plasma shutdown, logout or lock. |
 | `forceLogoutSeconds` | `20` | If that hasn't happened this long after the grace period, the daemon does it through logind (power off, terminate sessions, or lock). |
 | `pamServices` | `[ "login" ]` | PAM services that refuse logins without time left. On NixOS, SDDM's account stack includes `login`, so this covers both graphical and console logins. |
-| `package` | built from this repo | The screentime package. |
+| `package` | prebuilt release if current, else from source | The screentime package. |
 
 The module:
 - writes `/etc/screentime/config.toml`, validated at build time with
@@ -252,7 +273,8 @@ The code is laid out as:
   persistence, D-Bus proxies and tray icon rendering.
 - **Binaries:** the three programs live in `src/bin/`.
 - **Packaging:** `package.nix` builds the package (running the tests in its
-  check phase), and `module.nix` is the NixOS module.
+  check phase), `package-bin.nix` installs a prebuilt GitHub release, and
+  `module.nix` is the NixOS module.
 
 ### End-to-end testing without a desktop
 
