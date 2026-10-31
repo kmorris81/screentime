@@ -54,6 +54,11 @@ let
     && (lib.importJSON ./release.json).version == (lib.importTOML ./Cargo.toml).package.version
     && pkgs.stdenv.hostPlatform.system == "x86_64-linux";
 
+  loginTheme = pkgs.callPackage ./login-theme.nix {
+    screentime = cfg.package;
+    inherit (cfg.loginScreen) user;
+  };
+
   settings = {
     idle_timeout_secs = cfg.idleMinutes * 60;
     input_idle_only = cfg.inputIdleOnly;
@@ -181,64 +186,108 @@ in
       default = [ "login" ];
       description = "PAM services that refuse logins for users without time left.";
     };
+
+    loginScreen = {
+      enable = lib.mkEnableOption ''
+        a screen-time banner on the SDDM login screen, and an explanation
+        when screentime refuses a login. This switches SDDM to a patched
+        copy of Plasma's Breeze theme ("breeze-screentime")'';
+
+      user = mkOption {
+        type = types.nullOr types.str;
+        default =
+          let
+            names = lib.attrNames cfg.users;
+          in
+          if lib.length names == 1 then lib.head names else null;
+        defaultText = lib.literalMD "the managed user, if there is exactly one";
+        example = "benny";
+        description = "Managed user whose screen time the login screen shows.";
+      };
+    };
   };
 
-  config = lib.mkIf cfg.enable {
-    assertions = lib.mapAttrsToList (name: user: {
-      assertion = lib.all (d: lib.elem d dayNames) (lib.attrNames user.days);
-      message = "services.screentime.users.${name}.days: day names must be one of ${lib.concatStringsSep ", " dayNames}";
-    }) cfg.users;
+  config = lib.mkIf cfg.enable (
+    lib.mkMerge [
+      {
+        assertions = lib.mapAttrsToList (name: user: {
+          assertion = lib.all (d: lib.elem d dayNames) (lib.attrNames user.days);
+          message = "services.screentime.users.${name}.days: day names must be one of ${lib.concatStringsSep ", " dayNames}";
+        }) cfg.users;
 
-    environment.etc."screentime/config.toml".source = configFile;
-    environment.systemPackages = [ cfg.package ];
-    services.dbus.packages = [ cfg.package ];
+        environment.etc."screentime/config.toml".source = configFile;
+        environment.systemPackages = [ cfg.package ];
+        services.dbus.packages = [ cfg.package ];
 
-    systemd.services.screentimed = {
-      description = "Screen-time limits";
-      wantedBy = [ "multi-user.target" ];
-      after = [
-        "dbus.service"
-        "systemd-logind.service"
-      ];
-      restartTriggers = [ configFile ];
-      serviceConfig = {
-        Type = "dbus";
-        BusName = "org.screentime.Daemon1";
-        ExecStart = "${cfg.package}/bin/screentimed";
-        Restart = "always";
-        RestartSec = 2;
-        StateDirectory = "screentime";
-      };
-    };
+        systemd.services.screentimed = {
+          description = "Screen-time limits";
+          wantedBy = [ "multi-user.target" ];
+          after = [
+            "dbus.service"
+            "systemd-logind.service"
+          ];
+          restartTriggers = [ configFile ];
+          serviceConfig = {
+            Type = "dbus";
+            BusName = "org.screentime.Daemon1";
+            ExecStart = "${cfg.package}/bin/screentimed";
+            Restart = "always";
+            RestartSec = 2;
+            StateDirectory = "screentime";
+          };
+        };
 
-    # Runs in each managed user's desktop session. Stopping it doesn't help:
-    # without heartbeats the daemon counts the user as active.
-    systemd.user.services.screentime-agent = {
-      description = "Screen-time tray countdown and idle tracking";
-      wantedBy = [ "graphical-session.target" ];
-      partOf = [ "graphical-session.target" ];
-      after = [ "graphical-session.target" ];
-      unitConfig.ConditionUser = map (u: "|${u}") (lib.attrNames cfg.users);
-      serviceConfig = {
-        ExecStart = "${cfg.package}/bin/screentime-agent";
-        Restart = "always";
-        RestartSec = 5;
-      };
-    };
+        # Runs in each managed user's desktop session. Stopping it doesn't help:
+        # without heartbeats the daemon counts the user as active.
+        systemd.user.services.screentime-agent = {
+          description = "Screen-time tray countdown and idle tracking";
+          wantedBy = [ "graphical-session.target" ];
+          partOf = [ "graphical-session.target" ];
+          after = [ "graphical-session.target" ];
+          unitConfig.ConditionUser = map (u: "|${u}") (lib.attrNames cfg.users);
+          serviceConfig = {
+            ExecStart = "${cfg.package}/bin/screentime-agent";
+            Restart = "always";
+            RestartSec = 5;
+          };
+        };
 
-    security.pam.services = lib.genAttrs cfg.pamServices (service: {
-      rules.account.screentime = {
-        control = "required";
-        modulePath = "${pkgs.pam}/lib/security/pam_exec.so";
-        args = [
-          "quiet"
-          "stdout"
-          "${cfg.package}/bin/screentime"
-          "pam-check"
+        security.pam.services = lib.genAttrs cfg.pamServices (service: {
+          rules.account.screentime = {
+            control = "required";
+            modulePath = "${pkgs.pam}/lib/security/pam_exec.so";
+            args = [
+              "quiet"
+              "stdout"
+              "${cfg.package}/bin/screentime"
+              "pam-check"
+            ];
+            # First in the stack, ahead of any `sufficient` rules that could skip it
+            order = 10000;
+          };
+        });
+      }
+
+      (lib.mkIf cfg.loginScreen.enable {
+        assertions = [
+          {
+            assertion = cfg.loginScreen.user != null && cfg.users ? ${toString cfg.loginScreen.user};
+            message = "services.screentime.loginScreen.user must name one of services.screentime.users (${lib.concatStringsSep ", " (lib.attrNames cfg.users)}).";
+          }
         ];
-        # First in the stack, ahead of any `sufficient` rules that could skip it
-        order = 10000;
-      };
-    });
-  };
+
+        environment.systemPackages = [ loginTheme ];
+        services.displayManager.sddm = {
+          theme = "breeze-screentime";
+          # The banner's data engine; Plasma's module adds it too.
+          extraPackages = [ pkgs.kdePackages.plasma5support ];
+          # What the sddm module sets for theme = "breeze".
+          settings.Theme = {
+            CursorTheme = lib.mkDefault "breeze_cursors";
+            CursorSize = lib.mkDefault 24;
+          };
+        };
+      })
+    ]
+  );
 }

@@ -63,6 +63,11 @@ Plasma on Wayland:
 - **Admin overrides for today:** bonus time, no limits for the rest of the
   day, extending past a window, or ending the day now. Overrides reset at
   midnight and survive restarts.
+- **Login screen (optional):** a banner on SDDM's login screen with one
+  user's time ("Benny · 47m left", a progress bar, "allowed until 20:00", or
+  "no screen time left today · Next: Sat 09:00"). Refused logins say why
+  ("No screen time left today", "Outside allowed hours") instead of "Login
+  Failed".
 - **Build-time validation:** a typo or overlapping windows in the schedule
   fail `nixos-rebuild` instead of breaking the daemon at runtime.
 
@@ -163,6 +168,35 @@ added as a submodule).
 Rebuild, then check `systemctl status screentimed`. The agent starts with the
 managed user's next graphical login.
 
+[`examples/screentime.nix`](examples/screentime.nix) is a fuller example,
+including the actions and the login screen.
+
+### Login screen banner
+
+```nix
+services.screentime.loginScreen = {
+  enable = true;
+  user = "benny"; # defaults to the managed user if there's only one
+};
+```
+
+SDDM has no plugin slot for this, so the module switches it to
+`breeze-screentime` (`login-theme.nix`): a copy of Plasma's Breeze login
+theme with `sddm/ScreenTimeStatus.qml` added and three small patches to
+its `Main.qml`. The banner runs `screentime status --json USER` every 10
+seconds through Plasma's `executable` data engine (plasma5support) as the
+`sddm` user.
+
+- If the daemon isn't reachable, the banner hides; logins work as usual.
+- The patches are anchored on exact lines of Breeze's `Main.qml`. If a
+  Plasma update changes them, the rebuild fails in `login-theme.nix` (not
+  at the login screen); set `loginScreen.enable = false` until it's fixed.
+- KDE keeps plasma5support for compatibility. If a future Plasma drops it,
+  the banner stays hidden and logins are unaffected.
+- The banner shows one user's time, to anyone at the login screen.
+- It replaces whatever SDDM theme was configured, and only covers SDDM, not
+  Plasma's lock screen.
+
 ### Prebuilt binaries
 
 The module doesn't compile anything when `release.json` describes the
@@ -200,6 +234,8 @@ All options live under `services.screentime`.
 | `logoutGraceSeconds` | `30` | Time between running out and the clean Plasma shutdown, logout or lock. |
 | `forceLogoutSeconds` | `20` | If that hasn't happened this long after the grace period, the daemon does it through logind (power off, terminate sessions, or lock). |
 | `pamServices` | `[ "login" ]` | PAM services that refuse logins without time left. On NixOS, SDDM's account stack includes `login`, so this covers both graphical and console logins. |
+| `loginScreen.enable` | `false` | Show a screen-time banner on the SDDM login screen and explain refused logins. Switches SDDM to the `breeze-screentime` theme. |
+| `loginScreen.user` | the managed user, if there's only one | Whose time the banner shows. |
 | `package` | prebuilt release if current, else from source | The screentime package. |
 
 The module:
@@ -209,11 +245,14 @@ The module:
 - adds the `screentimed` system service and the `screentime-agent` user
   service, the latter only for managed users
 - adds a `pam_exec` account rule
+- with `loginScreen.enable`, builds and selects the `breeze-screentime`
+  SDDM theme
 
 ## Admin CLI
 
 ```sh
 screentime status [USER]            # time left, used/limit, bonus, window, next window
+screentime status --json [USER]     # the same as JSON, one object per line
 sudo screentime bonus USER 30m      # add time today: 30, 30m, 1h, 1h30m, 90s, -15m
 sudo screentime off USER            # no limits or windows for the rest of today
 sudo screentime extend USER 21:30   # allow use past today's window until 21:30
@@ -283,6 +322,8 @@ The code is laid out as:
 - **Packaging:** `package.nix` builds the package (running the tests in its
   check phase), `package-bin.nix` installs a prebuilt GitHub release, and
   `module.nix` is the NixOS module.
+- **Login screen:** `login-theme.nix` builds the patched Breeze SDDM theme
+  around `sddm/ScreenTimeStatus.qml`.
 
 ### End-to-end testing without a desktop
 
@@ -336,5 +377,5 @@ Session `Lock` marks the fake session locked.
   session (e.g. an admin's SSH login).
 - With `lock`, kscreenlocker's PAM service doesn't run the screentime check,
   so unlocking works briefly before the daemon locks the screen again.
-- The SDDM greeter may show only a generic "login failed" rather than
-  screentime's explanation.
+- Without `loginScreen.enable`, the SDDM greeter shows only a generic
+  "Login Failed" rather than screentime's explanation.

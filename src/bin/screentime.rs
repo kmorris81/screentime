@@ -1,6 +1,6 @@
 //! screentime: admin CLI, and the PAM login check.
 //!
-//!   screentime status [USER]           time left / used (default: everyone)
+//!   screentime status [--json] [USER]  time left / used (default: everyone)
 //!   sudo screentime bonus USER 30m     add time for today (negative removes)
 //!   sudo screentime off|on|end USER    today-only overrides
 //!   sudo screentime extend USER 21:30  allow past the window until 21:30
@@ -18,7 +18,8 @@ use screentime::{Status, duration};
 
 const USAGE: &str = "\
 usage:
-  screentime status [USER]          show time left and used today
+  screentime status [--json] [USER] show time left and used today
+                                    (--json: one JSON object per line)
   screentime bonus USER DURATION    add time today, e.g. 30m, 1h, -15m
   screentime off USER               no limits or windows for the rest of today
   screentime on USER                undo off/extend/end for today (bonus stays)
@@ -65,7 +66,7 @@ fn print_status(st: &Status) {
     }
 }
 
-async fn status(user: Option<&str>) -> Result<()> {
+async fn status(user: Option<&str>, json: bool) -> Result<()> {
     let conn = daemon_bus().await?;
     let daemon = DaemonProxy::new(&conn).await?;
     let users: Vec<String> = match user {
@@ -77,11 +78,16 @@ async fn status(user: Option<&str>) -> Result<()> {
         },
     };
     for user in users {
-        let json = daemon
+        let reply = daemon
             .status(&user)
             .await
             .with_context(|| format!("asking screentimed about {user:?}"))?;
-        print_status(&serde_json::from_str(&json)?);
+        let st: Status = serde_json::from_str(&reply)?;
+        if json {
+            println!("{}", serde_json::to_string(&st)?);
+        } else {
+            print_status(&st);
+        }
     }
     Ok(())
 }
@@ -168,8 +174,10 @@ async fn run(args: &[String]) -> Result<()> {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["status"] => status(None).await,
-        ["status", user] => status(Some(user)).await,
+        ["status"] => status(None, false).await,
+        ["status", "--json"] => status(None, true).await,
+        ["status", "--json", user] | ["status", user, "--json"] => status(Some(user), true).await,
+        ["status", user] => status(Some(user), false).await,
         ["bonus", user, amount] => change(user, Change::Bonus(duration::parse(amount)?)).await,
         ["off", user] => change(user, Change::Off).await,
         ["on", user] => change(user, Change::Clear).await,

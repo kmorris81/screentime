@@ -9,6 +9,9 @@ and hard-won lessons that aren't obvious from the code.
 - Built for one real machine: **the kid's PC** (Dell XPS 15 9560, NixOS unstable,
   KDE Plasma 6 on Wayland, SDDM). Managed user `kid` is a locked-down child account;
   the parent/admin account is SSH-only (wheel) and uses the `screentime` CLI over SSH.
+  There are now two such PCs, one per kid (`benny`, `eli`), each with a single
+  managed user named after the kid; options that pick "the" user (e.g.
+  `loginScreen.user`) default to it when there's only one.
 - The NixOS config (the parent's separate `nixos-config` repo) pulls this repo as a
   non-flake input and imports the module:
   ```nix
@@ -86,6 +89,25 @@ and hard-won lessons that aren't obvious from the code.
 - End-to-end testing without a desktop: see "End-to-end testing" in README.md
   (`examples/fake_logind.rs` on a private session bus with
   `SCREENTIME_BUS=session`).
+- **Login screen** (`login-theme.nix`, `sddm/ScreenTimeStatus.qml`): a patched
+  copy of Breeze's SDDM theme, anchored on exact lines of its `Main.qml` with
+  `substituteInPlace --replace-fail`, so a Plasma update that moves them fails
+  the build, not the login screen. The banner gets data from `screentime
+  status --json` via plasma5support's `executable` engine; it must hide on any
+  error and never affect logging in.
+- Rendering the login theme without a desktop: build `kdePackages.sddm` with
+  the Plasma 6 module's `extraPackages` (plus `plasma-workspace`,
+  `plasma-desktop`, `breeze`; leave out `qtvirtualkeyboard`), point
+  `login-theme.nix` at a stub `screentime` that `cat`s a JSON file, then run
+  `sddm-greeter-qt6 --test-mode --theme DIR` under `Xvfb` with
+  `QT_QUICK_BACKEND=software QT_XCB_GL_INTEGRATION=none QT_QPA_PLATFORM=xcb`,
+  a fonts.conf with `noto-fonts`, a user with uid >= 1000, and
+  `/etc/sddm.conf` containing `[General]` `InputMethod=` (else the virtual
+  keyboard covers the screen). Screenshot with `xwd -root | convert`.
+  Test mode can't attempt a login, so check the "Login Failed" path by
+  calling `screentime.refusal(...)` from a temporary Timer in a copy.
+- With the container's nix 2.26, `import "${pkgs.path}/..."` fails with
+  "path ... is not valid"; import from the `fetchTarball` result instead.
 - Real-world testing happens on the kid's PC: rebuild the config there, then
   `journalctl -u screentimed -f` and
   `sudo journalctl _SYSTEMD_USER_UNIT=screentime-agent.service`.
