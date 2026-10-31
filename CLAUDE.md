@@ -94,7 +94,21 @@ and hard-won lessons that aren't obvious from the code.
   `substituteInPlace --replace-fail`, so a Plasma update that moves them fails
   the build, not the login screen. The banner gets data from `screentime
   status --json` via plasma5support's `executable` engine; it must hide on any
-  error and never affect logging in.
+  error and never affect logging in. `loginScreen.enable` also covers the
+  lock screen (`lock-screen.nix`): a full copy of plasma-desktop's
+  `org.kde.plasma.desktop` shell package with `LockScreenUi.qml` patched,
+  linked over the profile's copy in `environment.extraSetup`. Don't
+  override single files with `lib.hiPrio`: KPackage rejects package files
+  whose real path is outside the package directory ("Path traversal attempt
+  detected") and kscreenlocker falls back to its built-in screen. Don't
+  rename the shell either: Plasma keys desktop layouts on its name.
+  `environment.extraSetup` also runs in every per-user profile
+  (`users.users.<name>.packages`, which home-manager's `useUserPackages`
+  fills), so anything in it must do nothing when its target is missing;
+  test with a user that has `packages` set.
+- Changes to Nix files or `sddm/*.qml` alone need no version bump or
+  release: they're read from the repo at rebuild time, not shipped in the
+  release tarball.
 - Rendering the login theme without a desktop: build `kdePackages.sddm` with
   the Plasma 6 module's `extraPackages` (plus `plasma-workspace`,
   `plasma-desktop`, `breeze`; leave out `qtvirtualkeyboard`), point
@@ -106,6 +120,13 @@ and hard-won lessons that aren't obvious from the code.
   keyboard covers the screen). Screenshot with `xwd -root | convert`.
   Test mode can't attempt a login, so check the "Login Failed" path by
   calling `screentime.refusal(...)` from a temporary Timer in a copy.
+  The lock screen renders the same way with
+  `${kscreenlocker}/libexec/kscreenlocker_greet --testing --shell
+  org.kde.plasma.desktop`, with `XDG_DATA_DIRS`, `QML_IMPORT_PATH` and
+  `QT_PLUGIN_PATH` pointing at a `buildEnv` of the Plasma packages whose
+  `postBuild` is the module's `extraSetup`. Without a window manager its
+  window is 800x600 at the top left. "falling back to built-in locker" in
+  its log means the QML didn't load.
 - With the container's nix 2.26, `import "${pkgs.path}/..."` fails with
   "path ... is not valid"; import from the `fetchTarball` result instead.
 - Real-world testing happens on the kid's PC: rebuild the config there, then

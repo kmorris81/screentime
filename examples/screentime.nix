@@ -19,9 +19,10 @@ in
     limitAction = "logout"; # minutes used up
     windowEndAction = "shutdown"; # allowed window over
 
-    # Banner on the SDDM login screen ("benny · 47m left"), and refused
-    # logins explained ("No screen time left today • Next: Sat 09:00").
-    # Switches SDDM to the "breeze-screentime" theme.
+    # Banner on the SDDM login screen and the Plasma lock screen
+    # ("Benny · 47m left"), and refused logins explained ("No screen time
+    # left today", "Outside allowed hours"). Switches SDDM to the
+    # "breeze-screentime" theme.
     loginScreen = {
       enable = true;
       user = kid; # the default when there's only one managed user

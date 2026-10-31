@@ -1,11 +1,13 @@
 /*
- * Screen-time banner for the SDDM login screen. login-theme.nix copies
- * Plasma's Breeze theme, drops this file next to its Main.qml and patches
- * Main.qml to show it and to explain refused logins.
+ * Screen-time banner for the SDDM login screen and the Plasma lock screen.
+ * login-theme.nix copies Plasma's Breeze SDDM theme, drops this file next to
+ * its Main.qml and patches Main.qml to show it and to explain refused logins;
+ * lock-screen.nix does the same for the lock screen's LockScreenUi.qml.
  *
  * Runs `screentime status --json USER` every few seconds through Plasma's
  * "executable" data engine (plasma5support). If that fails (daemon not up
- * yet, engine missing) the banner just stays hidden; logins are unaffected.
+ * yet, engine missing, user not managed) the banner just stays hidden;
+ * logging in and unlocking are unaffected.
  */
 import QtQuick
 import QtQuick.Layouts
@@ -16,14 +18,16 @@ import org.kde.plasma.plasma5support as P5Support
 Rectangle {
     id: banner
 
-    // Set by login-theme.nix.
+    // Set by login-theme.nix / lock-screen.nix. `user` is only needed to
+    // explain refused logins; the name shown comes from the status.
     property string command
     property string user
 
     // The parsed status, or null while it's unavailable.
     property var status: null
 
-    readonly property string name: user.charAt(0).toUpperCase() + user.slice(1)
+    readonly property string name: status === null ? ""
+        : status.user.charAt(0).toUpperCase() + status.user.slice(1)
     readonly property bool limited: status !== null && status.allowed_now && !status.unlimited
     readonly property color levelColor: {
         if (!limited) {
@@ -60,11 +64,11 @@ Rectangle {
                                   : "No allowed time in the coming week";
     }
 
-    // Why screentime refused `name`'s login, or "" if it didn't (wrong
+    // Why screentime refused `loginUser`'s login, or "" if it didn't (wrong
     // password, another user, status unknown). Short, since it shares the
     // password box's width; the banner below says when it's next allowed.
-    function refusal(name) {
-        if (status === null || name !== user || status.allowed_now) {
+    function refusal(loginUser) {
+        if (status === null || user === "" || loginUser !== status.user || status.allowed_now) {
             return "";
         }
         return status.cutoff === "window" ? "Outside allowed hours"

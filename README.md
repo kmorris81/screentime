@@ -63,8 +63,8 @@ Plasma on Wayland:
 - **Admin overrides for today:** bonus time, no limits for the rest of the
   day, extending past a window, or ending the day now. Overrides reset at
   midnight and survive restarts.
-- **Login screen (optional):** a banner on SDDM's login screen with one
-  user's time ("Benny · 47m left", a progress bar, "allowed until 20:00", or
+- **Login and lock screen (optional):** a banner on SDDM's login screen
+  and Plasma's lock screen with the user's time ("Benny · 47m left", a progress bar, "allowed until 20:00", or
   "no screen time left today · Next: Sat 09:00"). Refused logins say why
   ("No screen time left today", "Outside allowed hours") instead of "Login
   Failed".
@@ -171,7 +171,7 @@ managed user's next graphical login.
 [`examples/screentime.nix`](examples/screentime.nix) is a fuller example,
 including the actions and the login screen.
 
-### Login screen banner
+### Login and lock screen banner
 
 ```nix
 services.screentime.loginScreen = {
@@ -180,22 +180,40 @@ services.screentime.loginScreen = {
 };
 ```
 
-SDDM has no plugin slot for this, so the module switches it to
-`breeze-screentime` (`login-theme.nix`): a copy of Plasma's Breeze login
-theme with `sddm/ScreenTimeStatus.qml` added and three small patches to
-its `Main.qml`. The banner runs `screentime status --json USER` every 10
-seconds through Plasma's `executable` data engine (plasma5support) as the
-`sddm` user.
+This puts the same banner on two screens:
 
-- If the daemon isn't reachable, the banner hides; logins work as usual.
-- The patches are anchored on exact lines of Breeze's `Main.qml`. If a
-  Plasma update changes them, the rebuild fails in `login-theme.nix` (not
-  at the login screen); set `loginScreen.enable = false` until it's fixed.
+- **SDDM login screen:** shows `loginScreen.user`'s time. SDDM has no
+  plugin slot, so the module switches it to `breeze-screentime`
+  (`login-theme.nix`): a copy of Plasma's Breeze login theme with
+  `sddm/ScreenTimeStatus.qml` added and three small patches to its
+  `Main.qml`, which also explain refused logins.
+- **Plasma lock screen:** shows whoever is locked (nothing for unmanaged
+  users). The lock screen lives in Plasma's `org.kde.plasma.desktop` shell
+  package, so `lock-screen.nix` builds a full copy of that package with the
+  banner added to `LockScreenUi.qml`, and the module points the system
+  profile's copy at it (`environment.extraSetup`). The shell keeps its name,
+  so desktop layouts are untouched. An unlock is never refused by
+  screentime (the lock screen doesn't run PAM's account checks), so there's
+  no failure message to explain there.
+
+Either way the banner runs `screentime status --json USER` every 10 seconds
+through Plasma's `executable` data engine (plasma5support), as `sddm` on the
+login screen and as the user on the lock screen.
+
+- If the daemon isn't reachable, the banner hides; logging in and
+  unlocking work as usual. If the lock screen QML fails to load at all,
+  kscreenlocker falls back to its built-in lock screen.
+- The patches are anchored on exact lines of Breeze's `Main.qml` and the
+  lock screen's `LockScreenUi.qml` (unchanged from Plasma 6.6 to 6.8). If a
+  Plasma update changes them, the rebuild fails in `login-theme.nix` or
+  `lock-screen.nix`; set `loginScreen.enable = false` until it's fixed.
 - KDE keeps plasma5support for compatibility. If a future Plasma drops it,
-  the banner stays hidden and logins are unaffected.
-- The banner shows one user's time, to anyone at the login screen.
-- It replaces whatever SDDM theme was configured, and only covers SDDM, not
-  Plasma's lock screen.
+  the banner stays hidden.
+- The login screen banner shows one user's time to anyone at the screen.
+- It replaces whatever SDDM theme was configured.
+- A user can hide the lock screen banner for themselves by putting their
+  own copy of the shell package in `~/.local/share/plasma/shells/`. That
+  only affects the banner, not the password check.
 
 ### Prebuilt binaries
 
@@ -234,8 +252,8 @@ All options live under `services.screentime`.
 | `logoutGraceSeconds` | `30` | Time between running out and the clean Plasma shutdown, logout or lock. |
 | `forceLogoutSeconds` | `20` | If that hasn't happened this long after the grace period, the daemon does it through logind (power off, terminate sessions, or lock). |
 | `pamServices` | `[ "login" ]` | PAM services that refuse logins without time left. On NixOS, SDDM's account stack includes `login`, so this covers both graphical and console logins. |
-| `loginScreen.enable` | `false` | Show a screen-time banner on the SDDM login screen and explain refused logins. Switches SDDM to the `breeze-screentime` theme. |
-| `loginScreen.user` | the managed user, if there's only one | Whose time the banner shows. |
+| `loginScreen.enable` | `false` | Show a screen-time banner on the SDDM login screen and the Plasma lock screen, and explain refused logins. Switches SDDM to the `breeze-screentime` theme and the desktop shell package to a patched copy. |
+| `loginScreen.user` | the managed user, if there's only one | Whose time the login screen banner shows (the lock screen shows whoever is locked). |
 | `package` | prebuilt release if current, else from source | The screentime package. |
 
 The module:
@@ -246,7 +264,8 @@ The module:
   service, the latter only for managed users
 - adds a `pam_exec` account rule
 - with `loginScreen.enable`, builds and selects the `breeze-screentime`
-  SDDM theme
+  SDDM theme, and swaps in the patched desktop shell package for the lock
+  screen
 
 ## Admin CLI
 
@@ -322,8 +341,9 @@ The code is laid out as:
 - **Packaging:** `package.nix` builds the package (running the tests in its
   check phase), `package-bin.nix` installs a prebuilt GitHub release, and
   `module.nix` is the NixOS module.
-- **Login screen:** `login-theme.nix` builds the patched Breeze SDDM theme
-  around `sddm/ScreenTimeStatus.qml`.
+- **Login and lock screen:** `login-theme.nix` builds the patched Breeze
+  SDDM theme and `lock-screen.nix` the patched lock screen, both around
+  `sddm/ScreenTimeStatus.qml`.
 
 ### End-to-end testing without a desktop
 

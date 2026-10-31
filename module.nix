@@ -54,6 +54,8 @@ let
     && (lib.importJSON ./release.json).version == (lib.importTOML ./Cargo.toml).package.version
     && pkgs.stdenv.hostPlatform.system == "x86_64-linux";
 
+  lockScreen = pkgs.callPackage ./lock-screen.nix { screentime = cfg.package; };
+
   loginTheme = pkgs.callPackage ./login-theme.nix {
     screentime = cfg.package;
     inherit (cfg.loginScreen) user;
@@ -189,9 +191,11 @@ in
 
     loginScreen = {
       enable = lib.mkEnableOption ''
-        a screen-time banner on the SDDM login screen, and an explanation
-        when screentime refuses a login. This switches SDDM to a patched
-        copy of Plasma's Breeze theme ("breeze-screentime")'';
+        a screen-time banner on the SDDM login screen and the Plasma lock
+        screen, and an explanation when screentime refuses a login. This
+        switches SDDM to a patched copy of Plasma's Breeze theme
+        ("breeze-screentime") and Plasma's desktop shell package to a copy
+        whose lock screen has the banner'';
 
       user = mkOption {
         type = types.nullOr types.str;
@@ -202,7 +206,11 @@ in
           if lib.length names == 1 then lib.head names else null;
         defaultText = lib.literalMD "the managed user, if there is exactly one";
         example = "benny";
-        description = "Managed user whose screen time the login screen shows.";
+        description = ''
+          Managed user whose screen time the SDDM login screen shows. The
+          lock screen always shows whoever is locked (nothing, for users
+          screentime doesn't manage).
+        '';
       };
     };
   };
@@ -277,6 +285,9 @@ in
         ];
 
         environment.systemPackages = [ loginTheme ];
+        # Points the profile's org.kde.plasma.desktop shell package at a copy
+        # with the banner on the lock screen (see lock-screen.nix).
+        environment.extraSetup = lockScreen.extraSetup "$out";
         services.displayManager.sddm = {
           theme = "breeze-screentime";
           # The banner's data engine; Plasma's module adds it too.
