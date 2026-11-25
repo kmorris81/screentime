@@ -15,11 +15,8 @@ services:
     ports:
       - "8470:8470"
     volumes:
-      - screentime-data:/data
+      - ./data:/data
     environment:
       # The PCs' time zone: "today" (overrides, status) is the server's date.
-      TZ: America/Chicago
+      TZ: America/New_York
     restart: unless-stopped
-
-volumes:
-  screentime-data:

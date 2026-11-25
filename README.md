@@ -308,6 +308,7 @@ screentime --server pi.lan status            # everyone, with when each PC last 
 screentime --server pi.lan bonus benny 30m   # works while benny's PC is off
 screentime --server pi.lan config edit       # edit the policy in $EDITOR
 docker exec screentime screentime status     # the image's CLI points at its server
+docker exec -i screentime screentime config set - < policy.toml   # -i passes stdin
 ```
 
 On a PC in server mode, `sudo screentime bonus ...` and the other changes
