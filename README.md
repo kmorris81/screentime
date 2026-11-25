@@ -61,7 +61,8 @@ Plasma on Wayland:
     refused login later never shuts the computer down.
   - Logins are refused at SDDM and on text consoles until the next window.
 - **Admin overrides for today:** bonus time, no limits for the rest of the
-  day, extending past a window, or ending the day now. Overrides reset at
+  day, an extra window (to start early, end late, or both), or ending the
+  day now. Overrides reset at
   midnight and survive restarts.
 - **Login and lock screen (optional):** a banner on SDDM's login screen
   and Plasma's lock screen with the user's time ("Benny · 47m left", a progress bar, "allowed until 20:00", or
@@ -92,7 +93,7 @@ Plasma on Wayland:
  │   • asks logind which sessions are in front   │
  │   • power off / terminate / lock as fallback  │
  └───────────────▲───────────────────────────────┘
-                 │ system D-Bus: bonus / off / extend / end
+                 │ system D-Bus: bonus / off / allow / end
          screentime CLI (admin, e.g. over SSH)
 
   pam_exec → `screentime pam-check` refuses logins with no time left
@@ -114,7 +115,7 @@ The agent runs as the restricted user, so it is treated as untrusted:
   PID and accepts a heartbeat only if `/proc/<pid>/exe` is the packaged agent
   binary. Something like `busctl call ... Heartbeat b true` is rejected.
 - **Admin calls need root.** Status is readable by anyone. Every change
-  (bonus, off, extend, end) requires uid 0.
+  (bonus, off, allow, end) requires uid 0.
 - **The login check doesn't depend on the daemon.** `pam-check` reads the
   config and state files directly. For a managed user, any error refuses the
   login.
@@ -243,7 +244,7 @@ everything from `screentime-server` instead, and you change things there:
   table per kid and day. Each PC uses the settings and its own users'
   schedules from it. A user the PC manages but the policy doesn't mention
   gets no time.
-- **Overrides** (`bonus`, `off`, `extend`, `end`, `on`) are kept on the
+- **Overrides** (`bonus`, `off`, `allow`, `end`, `on`) are kept on the
   server per user and day; the PC takes today's from the server on every
   poll, replacing its own. The minutes used are counted on the PC as
   always, and reported to the server.
@@ -382,13 +383,13 @@ screentime status [USER]            # time left, used/limit, bonus, window, next
 screentime status --json [USER]     # the same as JSON, one object per line
 sudo screentime bonus USER 30m      # add time today: 30, 30m, 1h, 1h30m, 90s, -15m
 sudo screentime off USER            # no limits or windows for the rest of today
-sudo screentime extend USER 21:30   # allow use past today's window until 21:30
+sudo screentime allow USER 13:00-21:00  # an extra window today: start early, end late
 sudo screentime end USER            # out of time now (limitAction after the grace period)
-sudo screentime on USER             # undo off/extend/end for today (bonus stays)
+sudo screentime on USER             # undo off/allow/end for today (bonus stays)
 screentime help
 
 # with a server (see Server mode); no root needed
-screentime --server URL status|bonus|off|extend|end|on ...
+screentime --server URL status|bonus|off|allow|end|on ...
 screentime --server URL config get|set FILE|edit
 ```
 
@@ -404,11 +405,15 @@ kid (counting)
 ```
 
 How the overrides interact:
-- `extend` stretches today's allowed time from the start of the first window
-  to the given time. It also fills any gap between windows. The daily limit
-  still applies, so combine it with `bonus` if the minutes are used up too.
+- `allow` adds a window for today, merged with the scheduled ones: with a
+  15:00-20:00 schedule, `allow 13:00-21:00` starts the day at 13:00 and ends
+  it at 21:00, and `allow 12:00-14:00` on a day with 09:00-12:00 and
+  14:00-21:00 fills the gap. It can be given several times.
+- `allow` doesn't add minutes: the daily limit still applies. Combine it
+  with `bonus` if the minutes are used up, or on a day without windows
+  (whose limit is 0); the CLI points this out.
 - `end` wins over everything else.
-- `on` clears `off`, `extend` and `end`, but keeps any bonus.
+- `on` clears `off`, `allow` and `end`, but keeps any bonus.
 
 Logs:
 
@@ -435,9 +440,9 @@ system bus:
 | `Status(s user) → s` | anyone | JSON status. An empty user means the caller. |
 | `AddBonus(s user, x secs) → s` | root | Add or remove time for today. |
 | `SetUnlimited(s user, b on) → s` | root | No limits for the rest of today. |
-| `ExtendUntil(s user, s "HH:MM") → s` | root | Allow use until that time today. |
+| `AllowWindow(s user, s "HH:MM-HH:MM") → s` | root | An extra window today. |
 | `EndToday(s user) → s` | root | No more time today. |
-| `ClearOverrides(s user) → s` | root | Drop today's off/extend/end. |
+| `ClearOverrides(s user) → s` | root | Drop today's off/allow/end. |
 
 ## Development
 

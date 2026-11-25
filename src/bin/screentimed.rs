@@ -27,7 +27,7 @@ use zbus::{Connection, fdo};
 use screentime::config::{self, Config, TimeUpAction};
 use screentime::dbus::{LoginManagerProxy, LoginSessionProxy, SKIP_INHIBITORS};
 use screentime::remote::{self, Cached, Policy, Report, SyncRequest};
-use screentime::schedule::parse_hhmm;
+use screentime::schedule::parse_window;
 use screentime::state::{self, Change, State};
 use screentime::{BUS_NAME, OBJECT_PATH, Status};
 
@@ -206,16 +206,16 @@ impl Iface {
         self.admin(conn, &hdr, user, change).await
     }
 
-    /// Allow use until "HH:MM" today, past the scheduled windows.
-    async fn extend_until(
+    /// An extra "HH:MM-HH:MM" window for today, merged with the schedule.
+    async fn allow_window(
         &self,
         user: &str,
-        until: &str,
+        window: &str,
         #[zbus(header)] hdr: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<String> {
-        let minute = parse_hhmm(until).map_err(|e| fdo::Error::InvalidArgs(format!("{e:#}")))?;
-        self.admin(conn, &hdr, user, Change::Extend(minute)).await
+        let w = parse_window(window).map_err(|e| fdo::Error::InvalidArgs(format!("{e:#}")))?;
+        self.admin(conn, &hdr, user, Change::Allow(w)).await
     }
 
     /// Out of time for today, right now.
@@ -228,7 +228,7 @@ impl Iface {
         self.admin(conn, &hdr, user, Change::End).await
     }
 
-    /// Drop today's off/extend/end overrides (bonus time stays).
+    /// Drop today's off/allow/end overrides (bonus time stays).
     async fn clear_overrides(
         &self,
         user: &str,
@@ -447,14 +447,17 @@ fn apply_policy(sh: &mut Shared, local: &Config, policy: &Policy, config_changed
             .unwrap_or_else(|| state::DayUsage::new(today));
         let ours = sh.state.today(&user, today);
         let before = ours.clone();
-        ours.bonus_secs = theirs.bonus_secs;
-        ours.unlimited = theirs.unlimited;
-        ours.ended = theirs.ended;
-        ours.extend_until = theirs.extend_until;
+        ours.copy_overrides(&theirs);
         if *ours != before {
             eprintln!(
-                "{user}: overrides from the server: bonus {}s, off {}, ended {}, extended {:?}",
-                ours.bonus_secs, ours.unlimited, ours.ended, ours.extend_until
+                "{user}: overrides from the server: bonus {}s, off {}, ended {}, extra windows {:?}",
+                ours.bonus_secs,
+                ours.unlimited,
+                ours.ended,
+                ours.extra_windows
+                    .iter()
+                    .map(|w| screentime::schedule::fmt_window(*w))
+                    .collect::<Vec<_>>()
             );
             changed = true;
         }

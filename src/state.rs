@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+use crate::schedule::{Window, fmt_window};
+
 /// State directory. systemd's StateDirectory= sets $STATE_DIRECTORY.
 pub fn dir() -> PathBuf {
     std::env::var_os("SCREENTIME_STATE_DIR")
@@ -39,23 +41,24 @@ pub enum Change {
     Bonus(i64),
     /// No limits or windows for the rest of the day.
     Off,
-    /// Allowed until this minute of the day, past the windows.
-    Extend(u32),
+    /// An extra window for today (merged with the scheduled ones).
+    Allow(Window),
     /// No more time today.
     End,
-    /// Drop off/extend/end; bonus stays.
+    /// Drop off/allow/end; bonus stays.
     Clear,
 }
 
 impl Change {
-    /// Rejects an extension to a time that has already passed.
+    /// Rejects a window that ends before now.
     pub fn check(&self, now: chrono::NaiveTime) -> Result<()> {
-        if let Change::Extend(minute) = *self
-            && minute <= chrono::Timelike::num_seconds_from_midnight(&now) / 60
-        {
-            anyhow::bail!("{} has already passed", crate::schedule::fmt_hhmm(minute));
+        let now_min = chrono::Timelike::num_seconds_from_midnight(&now) / 60;
+        match *self {
+            Change::Allow(w) if w.end <= now_min => {
+                anyhow::bail!("{} has already ended", fmt_window(w))
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     pub fn apply(&self, u: &mut DayUsage) {
@@ -65,8 +68,8 @@ impl Change {
                 u.unlimited = true;
                 u.ended = false;
             }
-            Change::Extend(minute) => {
-                u.extend_until = Some(minute);
+            Change::Allow(w) => {
+                u.extra_windows.push(w);
                 u.ended = false;
             }
             Change::End => {
@@ -76,7 +79,7 @@ impl Change {
             Change::Clear => {
                 u.unlimited = false;
                 u.ended = false;
-                u.extend_until = None;
+                u.extra_windows.clear();
             }
         }
     }
@@ -92,9 +95,7 @@ impl Change {
                 )
             }
             Change::Off => "limits off for today".into(),
-            Change::Extend(minute) => {
-                format!("extended until {}", crate::schedule::fmt_hhmm(minute))
-            }
+            Change::Allow(w) => format!("allowed {} today", fmt_window(w)),
             Change::End => "time ended for today".into(),
             Change::Clear => "overrides cleared".into(),
         }
@@ -113,9 +114,9 @@ pub struct DayUsage {
     /// `screentime end`: no more time today, whatever else is set.
     #[serde(default)]
     pub ended: bool,
-    /// `screentime extend`: allowed until this minute of the day.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extend_until: Option<u32>,
+    /// `screentime allow`: extra windows for today.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_windows: Vec<Window>,
 }
 
 impl DayUsage {
@@ -126,8 +127,16 @@ impl DayUsage {
             bonus_secs: 0,
             unlimited: false,
             ended: false,
-            extend_until: None,
+            extra_windows: Vec::new(),
         }
+    }
+
+    /// Take `from`'s admin overrides; keep our own usage.
+    pub fn copy_overrides(&mut self, from: &DayUsage) {
+        self.bonus_secs = from.bonus_secs;
+        self.unlimited = from.unlimited;
+        self.ended = from.ended;
+        self.extra_windows = from.extra_windows.clone();
     }
 }
 
@@ -203,19 +212,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn noon() -> chrono::NaiveTime {
+        chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap()
+    }
+
     #[test]
     fn changes() {
         let mut u = DayUsage::new(NaiveDate::from_ymd_opt(2026, 10, 26).unwrap());
         Change::Bonus(600).apply(&mut u);
         Change::End.apply(&mut u);
         assert!(u.ended);
-        Change::Extend(21 * 60).apply(&mut u);
+        Change::Allow(Window {
+            start: 600,
+            end: 720,
+        })
+        .apply(&mut u);
         assert!(!u.ended);
+        assert_eq!(u.extra_windows.len(), 1);
         Change::Clear.apply(&mut u);
-        assert_eq!((u.bonus_secs, u.extend_until), (600, None));
-        let noon = chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap();
-        assert!(Change::Extend(11 * 60).check(noon).is_err());
-        assert!(Change::Extend(13 * 60).check(noon).is_ok());
+        assert_eq!(u.bonus_secs, 600);
+        assert!(u.extra_windows.is_empty());
+        let w = |start, end| Change::Allow(Window { start, end });
+        assert!(w(600, 720).check(noon()).is_err());
+        assert!(w(600, 721).check(noon()).is_ok());
         let json = serde_json::to_string(&Change::Bonus(60)).unwrap();
         assert_eq!(json, r#"{"bonus":60}"#);
         assert_eq!(

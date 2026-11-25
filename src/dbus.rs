@@ -27,11 +27,11 @@ pub trait Daemon {
     fn add_bonus(&self, user: &str, secs: i64) -> zbus::Result<String>;
     /// Root only. No limits or windows for the rest of today.
     fn set_unlimited(&self, user: &str, on: bool) -> zbus::Result<String>;
-    /// Root only. Allowed until "HH:MM" today, past the scheduled windows.
-    fn extend_until(&self, user: &str, until: &str) -> zbus::Result<String>;
+    /// Root only. An extra "HH:MM-HH:MM" window for today.
+    fn allow_window(&self, user: &str, window: &str) -> zbus::Result<String>;
     /// Root only. No more time today.
     fn end_today(&self, user: &str) -> zbus::Result<String>;
-    /// Root only. Drops today's off/extend/end overrides; bonus stays.
+    /// Root only. Drops today's off/allow/end overrides; bonus stays.
     fn clear_overrides(&self, user: &str) -> zbus::Result<String>;
 }
 

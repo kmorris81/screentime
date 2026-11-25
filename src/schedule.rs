@@ -7,7 +7,7 @@ use crate::state::DayUsage;
 use crate::{Cutoff, Status};
 
 /// `[start, end)` in minutes since midnight. `end` may be 1440 (24:00).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Window {
     pub start: u32,
     pub end: u32,
@@ -74,7 +74,7 @@ pub fn fmt_hhmm(min: u32) -> String {
     format!("{:02}:{:02}", min / 60, min % 60)
 }
 
-fn fmt_window(w: Window) -> String {
+pub fn fmt_window(w: Window) -> String {
     format!("{}-{}", fmt_hhmm(w.start), fmt_hhmm(w.end))
 }
 
@@ -83,25 +83,19 @@ impl Schedule {
         &self.days[dt.weekday().num_days_from_monday() as usize]
     }
 
-    /// Today's windows, with an `extend` override folded in: the extension
-    /// runs from the first window's start (or midnight) to `until`, merged
-    /// with the scheduled windows.
-    fn windows_today(day: &DayRules, extend_until: Option<u32>) -> Vec<Window> {
+    /// Today's windows with `allow`'s extra windows merged in.
+    fn windows_today(day: &DayRules, usage: &DayUsage) -> Vec<Window> {
         let mut windows = day.windows.clone();
-        if let Some(until) = extend_until {
-            let start = day.windows.first().map_or(0, |w| w.start).min(until);
-            windows.push(Window { start, end: until });
-            windows.sort_by_key(|w| w.start);
-            let mut merged: Vec<Window> = Vec::new();
-            for w in windows {
-                match merged.last_mut() {
-                    Some(last) if w.start <= last.end => last.end = last.end.max(w.end),
-                    _ => merged.push(w),
-                }
+        windows.extend(usage.extra_windows.iter().copied());
+        windows.sort_by_key(|w| w.start);
+        let mut merged: Vec<Window> = Vec::new();
+        for w in windows {
+            match merged.last_mut() {
+                Some(last) if w.start <= last.end => last.end = last.end.max(w.end),
+                _ => merged.push(w),
             }
-            windows = merged;
         }
-        windows
+        merged
     }
 
     /// Where we are relative to the schedule at `now`, given today's usage
@@ -112,7 +106,7 @@ impl Schedule {
         let limit_secs = (day.limit_secs as i64 + usage.bonus_secs).max(0) as u64;
         let now_secs = now.time().num_seconds_from_midnight();
         let unlimited = usage.unlimited && !usage.ended;
-        let windows = Self::windows_today(day, usage.extend_until);
+        let windows = Self::windows_today(day, usage);
         let window = windows
             .iter()
             .find(|w| w.start * 60 <= now_secs && now_secs < w.end * 60);
@@ -149,26 +143,38 @@ impl Schedule {
                 window.map(|w| fmt_hhmm(w.end))
             },
             // Later windows today only help if there's time left today.
-            next_window: self.next_window(now, usage.ended || used_secs >= limit_secs),
+            next_window: self.next_window(now, usage, usage.ended || used_secs >= limit_secs),
             counting: false,
             unlimited,
             ended: usage.ended,
-            extended_until: usage.extend_until.map(fmt_hhmm),
+            extra_windows: usage.extra_windows.iter().map(|w| fmt_window(*w)).collect(),
             cutoff,
         }
     }
 
     /// Start of the next window strictly after `now`, within a week.
-    fn next_window(&self, now: NaiveDateTime, skip_today: bool) -> Option<String> {
+    /// Today's overrides count for today.
+    fn next_window(
+        &self,
+        now: NaiveDateTime,
+        usage: &DayUsage,
+        skip_today: bool,
+    ) -> Option<String> {
         let now_min = now.time().num_seconds_from_midnight() / 60;
         let first = if skip_today { 1 } else { 0 };
         for offset in first..=7 {
             let dt = now + Duration::days(offset);
             let day = self.day(dt);
-            if day.limit_secs == 0 {
+            let (windows, limit) = if offset == 0 {
+                let limit = day.limit_secs as i64 + usage.bonus_secs;
+                (Self::windows_today(day, usage), limit)
+            } else {
+                (day.windows.clone(), day.limit_secs as i64)
+            };
+            if limit <= 0 {
                 continue;
             }
-            if let Some(w) = day.windows.iter().find(|w| offset > 0 || w.start > now_min) {
+            if let Some(w) = windows.iter().find(|w| offset > 0 || w.start > now_min) {
                 let label = if offset == 0 {
                     "today".to_string()
                 } else if offset == 1 {
@@ -316,20 +322,19 @@ mod tests {
     }
 
     #[test]
-    fn extend_after_window_and_through_gap() {
-        // Monday 15-20; extended to 21:30, it's 20:30 with 30 min used.
+    fn allow_past_window_and_through_gap() {
+        // Monday 15-20; allowed 15:00-21:30, it's 20:30 with 30 min used.
         let usage = DayUsage {
-            extend_until: Some(21 * 60 + 30),
+            extra_windows: vec![parse_window("15:00-21:30").unwrap()],
             ..u(30 * 60, 0)
         };
         let st = sched().evaluate("b", at(2026, 10, 26, 20, 30), &usage);
         assert!(st.allowed_now);
         assert_eq!(st.remaining_secs, 60 * 60);
         assert_eq!(st.window_end.as_deref(), Some("21:30"));
-        assert_eq!(st.extended_until.as_deref(), Some("21:30"));
         // Still bounded by the daily limit.
         let usage = DayUsage {
-            extend_until: Some(21 * 60 + 30),
+            extra_windows: vec![parse_window("15:00-21:30").unwrap()],
             ..u(90 * 60, 0)
         };
         assert!(
@@ -337,9 +342,9 @@ mod tests {
                 .evaluate("b", at(2026, 10, 26, 20, 30), &usage)
                 .allowed_now
         );
-        // Saturday 9-12 + 14-21: extending to 13:00 fills the gap until 13:00.
+        // Saturday 9-12 + 14-21: allowing 12:00-13:00 fills the gap until 13:00.
         let usage = DayUsage {
-            extend_until: Some(13 * 60),
+            extra_windows: vec![parse_window("12:00-13:00").unwrap()],
             ..u(0, 0)
         };
         let st = sched().evaluate("b", at(2026, 10, 31, 12, 30), &usage);
@@ -349,5 +354,45 @@ mod tests {
                 .evaluate("b", at(2026, 10, 31, 13, 30), &usage)
                 .allowed_now
         );
+    }
+
+    #[test]
+    fn allow_extra_windows() {
+        // Monday 15-20: allowing 13:00-16:00 starts the day early and merges
+        // with the window, so at 14:00 there's time until 20:00.
+        let usage = DayUsage {
+            extra_windows: vec![parse_window("13:00-16:00").unwrap()],
+            ..u(0, 0)
+        };
+        let st = sched().evaluate("b", at(2026, 10, 26, 14, 0), &usage);
+        assert!(st.allowed_now);
+        assert_eq!(st.window_end.as_deref(), Some("20:00"));
+        assert_eq!(st.extra_windows, ["13:00-16:00"]);
+        // Before it opens, it's the next window.
+        let st = sched().evaluate("b", at(2026, 10, 26, 12, 0), &usage);
+        assert!(!st.allowed_now);
+        assert_eq!(st.next_window.as_deref(), Some("today 13:00"));
+        // Starting early and ending late in one go.
+        let usage = DayUsage {
+            extra_windows: vec![parse_window("13:00-21:00").unwrap()],
+            ..u(0, 0)
+        };
+        let st = sched().evaluate("b", at(2026, 10, 26, 20, 30), &usage);
+        assert!(st.allowed_now);
+        assert_eq!(st.window_end.as_deref(), Some("21:00"));
+        // A day without windows has no minutes either: needs a bonus too.
+        let tue = at(2026, 10, 27, 10, 30);
+        let usage = DayUsage {
+            extra_windows: vec![parse_window("10:00-12:00").unwrap()],
+            ..u(0, 0)
+        };
+        assert!(!sched().evaluate("b", tue, &usage).allowed_now);
+        let usage = DayUsage {
+            bonus_secs: 3600,
+            ..usage
+        };
+        let st = sched().evaluate("b", tue, &usage);
+        assert!(st.allowed_now);
+        assert_eq!(st.remaining_secs, 3600);
     }
 }

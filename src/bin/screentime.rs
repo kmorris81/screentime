@@ -3,7 +3,7 @@
 //!   screentime status [--json] [USER]  time left / used (default: everyone)
 //!   sudo screentime bonus USER 30m     add time for today (negative removes)
 //!   sudo screentime off|on|end USER    today-only overrides
-//!   sudo screentime extend USER 21:30  allow past the window until 21:30
+//!   sudo screentime allow USER 13:00-21:30  an extra window today
 //!   screentime pam-check               for pam_exec: refuse logins with no time
 //!   screentime --server URL ...        the same against screentime-server,
 //!                                      plus `config get|set|edit`
@@ -17,7 +17,7 @@ use chrono::Local;
 use screentime::config::{self, Config};
 use screentime::dbus::{DaemonProxy, daemon_bus};
 use screentime::remote::{self, RemoteStatus};
-use screentime::schedule::parse_hhmm;
+use screentime::schedule::{fmt_window, parse_window};
 use screentime::state::{self, Change, State};
 use screentime::{Status, duration};
 
@@ -29,8 +29,9 @@ usage:
                           (--json: one JSON object per line)
   bonus USER DURATION     add time today, e.g. 30m, 1h, -15m
   off USER                no limits or windows for the rest of today
-  on USER                 undo off/extend/end for today (bonus stays)
-  extend USER HH:MM       allow use past today's window until HH:MM
+  on USER                 undo off/allow/end for today (bonus stays)
+  allow USER HH:MM-HH:MM  an extra window today, e.g. to start early, or
+                          both early and late (merged with the schedule)
   end USER                out of time now (limit action after grace)
   pam-check               PAM account check (uses $PAM_USER)
 
@@ -73,8 +74,8 @@ fn print_status(st: &Status) {
     if let Some(end) = &st.window_end {
         println!("  window: until {end}");
     }
-    if let Some(until) = &st.extended_until {
-        println!("  extended until {until}");
+    if !st.extra_windows.is_empty() {
+        println!("  extra:  {} (today)", st.extra_windows.join(", "));
     }
     if let Some(next) = &st.next_window {
         println!("  next:   {next}");
@@ -128,11 +129,7 @@ async fn change(user: &str, change: Change) -> Result<()> {
     let json = match change {
         Change::Bonus(secs) => daemon.add_bonus(user, secs).await,
         Change::Off => daemon.set_unlimited(user, true).await,
-        Change::Extend(minute) => {
-            daemon
-                .extend_until(user, &screentime::schedule::fmt_hhmm(minute))
-                .await
-        }
+        Change::Allow(w) => daemon.allow_window(user, &fmt_window(w)).await,
         Change::End => daemon.end_today(user).await,
         Change::Clear => daemon.clear_overrides(user).await,
     }
@@ -141,8 +138,21 @@ async fn change(user: &str, change: Change) -> Result<()> {
         zbus::Error::MethodError(_, Some(msg), _) => anyhow::anyhow!(msg),
         e => e.into(),
     })?;
-    print_status(&serde_json::from_str(&json)?);
+    let st: Status = serde_json::from_str(&json)?;
+    print_status(&st);
+    hint_no_minutes(&st, change);
     Ok(())
+}
+
+/// An extra window doesn't add minutes: say so when that leaves
+/// none, e.g. on a day without windows, whose limit is 0.
+fn hint_no_minutes(st: &Status, change: Change) {
+    if matches!(change, Change::Allow(_)) && st.used_secs >= st.limit_secs {
+        eprintln!(
+            "note: no minutes left today; add some with `screentime bonus {} 1h`",
+            st.user
+        );
+    }
 }
 
 /// Exit 0 to allow the login, 1 to refuse it. Works from the config and state
@@ -230,6 +240,7 @@ fn remote_status(client: &remote::Client, user: Option<&str>, json: bool) -> Res
 fn remote_change(client: &remote::Client, user: &str, change: Change) -> Result<()> {
     let rs: RemoteStatus = client.post_json(&format!("/api/v1/users/{user}/change"), &change)?;
     print_remote(&rs);
+    hint_no_minutes(&rs.status, change);
     println!(
         "(sent to {}; the PC applies it within a minute)",
         client.base()
@@ -297,7 +308,7 @@ fn parse_change(cmd: &str, rest: &[&str]) -> Result<Option<(String, Change)>> {
         ("bonus", [user, amount]) => (user, Change::Bonus(duration::parse(amount)?)),
         ("off", [user]) => (user, Change::Off),
         ("on", [user]) => (user, Change::Clear),
-        ("extend", [user, until]) => (user, Change::Extend(parse_hhmm(until)?)),
+        ("allow", [user, window]) => (user, Change::Allow(parse_window(window)?)),
         ("end", [user]) => (user, Change::End),
         _ => return Ok(None),
     };

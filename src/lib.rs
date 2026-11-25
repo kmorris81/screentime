@@ -38,8 +38,9 @@ pub struct Status {
     pub unlimited: bool,
     #[serde(default)]
     pub ended: bool,
-    #[serde(default)]
-    pub extended_until: Option<String>,
+    /// Extra windows allowed today ("HH:MM-HH:MM").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_windows: Vec<String>,
     /// Why `allowed_now` is false, if it is.
     #[serde(default)]
     pub cutoff: Option<Cutoff>,
