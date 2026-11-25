@@ -1,0 +1,29 @@
+# Example policy for screentime-server (server mode), covering both kids.
+# Upload with: screentime --server pi.lan config set examples/policy.toml
+# Same format as /etc/screentime/config.toml; each PC uses the settings
+# below and the schedule of the users it manages.
+
+idle_timeout_secs = 300
+input_idle_only = true
+limit_action = "logout"        # minutes used up: "shutdown", "logout" or "lock"
+window_end_action = "shutdown" # allowed window over
+logout_grace_secs = 30
+force_logout_secs = 20
+
+[users.benny.days]
+mon = { windows = ["15:00-20:00"], limit_minutes = 90 }
+tue = { windows = ["15:00-20:00"], limit_minutes = 90 }
+wed = { windows = ["15:00-20:00"], limit_minutes = 90 }
+thu = { windows = ["15:00-20:00"], limit_minutes = 90 }
+fri = { windows = ["15:00-21:00"], limit_minutes = 120 }
+sat = { windows = ["09:00-12:00", "14:00-21:00"], limit_minutes = 180 }
+sun = { windows = ["09:00-12:00", "14:00-20:00"], limit_minutes = 180 }
+
+[users.eli.days]
+mon = { windows = ["15:00-19:30"], limit_minutes = 60 }
+tue = { windows = ["15:00-19:30"], limit_minutes = 60 }
+wed = { windows = ["15:00-19:30"], limit_minutes = 60 }
+thu = { windows = ["15:00-19:30"], limit_minutes = 60 }
+fri = { windows = ["15:00-20:30"], limit_minutes = 90 }
+sat = { windows = ["09:00-12:00", "14:00-20:30"], limit_minutes = 150 }
+sun = { windows = ["09:00-12:00", "14:00-19:30"], limit_minutes = 150 }

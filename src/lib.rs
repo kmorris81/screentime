@@ -4,6 +4,7 @@ pub mod config;
 pub mod dbus;
 pub mod duration;
 pub mod icon;
+pub mod remote;
 pub mod schedule;
 pub mod state;
 

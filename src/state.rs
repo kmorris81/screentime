@@ -8,13 +8,97 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-/// State file path. systemd's StateDirectory= sets $STATE_DIRECTORY.
-pub fn path() -> PathBuf {
-    let dir = std::env::var_os("SCREENTIME_STATE_DIR")
+/// State directory. systemd's StateDirectory= sets $STATE_DIRECTORY.
+pub fn dir() -> PathBuf {
+    std::env::var_os("SCREENTIME_STATE_DIR")
         .or_else(|| std::env::var_os("STATE_DIRECTORY"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/screentime"));
-    dir.join("state.json")
+        .unwrap_or_else(|| PathBuf::from("/var/lib/screentime"))
+}
+
+/// State file path.
+pub fn path() -> PathBuf {
+    dir().join("state.json")
+}
+
+/// Atomic write: temp file + rename.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut f =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))
+}
+
+/// An admin change to today's overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Change {
+    /// Add (or with a negative value remove) time.
+    Bonus(i64),
+    /// No limits or windows for the rest of the day.
+    Off,
+    /// Allowed until this minute of the day, past the windows.
+    Extend(u32),
+    /// No more time today.
+    End,
+    /// Drop off/extend/end; bonus stays.
+    Clear,
+}
+
+impl Change {
+    /// Rejects an extension to a time that has already passed.
+    pub fn check(&self, now: chrono::NaiveTime) -> Result<()> {
+        if let Change::Extend(minute) = *self
+            && minute <= chrono::Timelike::num_seconds_from_midnight(&now) / 60
+        {
+            anyhow::bail!("{} has already passed", crate::schedule::fmt_hhmm(minute));
+        }
+        Ok(())
+    }
+
+    pub fn apply(&self, u: &mut DayUsage) {
+        match *self {
+            Change::Bonus(secs) => u.bonus_secs += secs,
+            Change::Off => {
+                u.unlimited = true;
+                u.ended = false;
+            }
+            Change::Extend(minute) => {
+                u.extend_until = Some(minute);
+                u.ended = false;
+            }
+            Change::End => {
+                u.ended = true;
+                u.unlimited = false;
+            }
+            Change::Clear => {
+                u.unlimited = false;
+                u.ended = false;
+                u.extend_until = None;
+            }
+        }
+    }
+
+    /// For the log: "bonus +30m", "limits off for today", ...
+    pub fn describe(&self) -> String {
+        match *self {
+            Change::Bonus(secs) => {
+                let sign = if secs < 0 { "-" } else { "+" };
+                format!(
+                    "bonus {sign}{}",
+                    crate::duration::format(secs.unsigned_abs())
+                )
+            }
+            Change::Off => "limits off for today".into(),
+            Change::Extend(minute) => {
+                format!("extended until {}", crate::schedule::fmt_hhmm(minute))
+            }
+            Change::End => "time ended for today".into(),
+            Change::Clear => "overrides cleared".into(),
+        }
+    }
 }
 
 /// One user's day. Admin overrides live here too, so they reset at midnight.
@@ -47,7 +131,7 @@ impl DayUsage {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct State {
     pub users: BTreeMap<String, DayUsage>,
 }
@@ -64,14 +148,8 @@ impl State {
         }
     }
 
-    /// Atomic write: temp file + rename.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let tmp = path.with_extension("json.tmp");
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))
+        write_atomic(path, serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     /// Today's usage for `user`, starting fresh when the date has changed.
@@ -123,5 +201,26 @@ mod tests {
                 .is_empty()
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changes() {
+        let mut u = DayUsage::new(NaiveDate::from_ymd_opt(2026, 10, 26).unwrap());
+        Change::Bonus(600).apply(&mut u);
+        Change::End.apply(&mut u);
+        assert!(u.ended);
+        Change::Extend(21 * 60).apply(&mut u);
+        assert!(!u.ended);
+        Change::Clear.apply(&mut u);
+        assert_eq!((u.bonus_secs, u.extend_until), (600, None));
+        let noon = chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        assert!(Change::Extend(11 * 60).check(noon).is_err());
+        assert!(Change::Extend(13 * 60).check(noon).is_ok());
+        let json = serde_json::to_string(&Change::Bonus(60)).unwrap();
+        assert_eq!(json, r#"{"bonus":60}"#);
+        assert_eq!(
+            serde_json::from_str::<Change>(r#""off""#).unwrap(),
+            Change::Off
+        );
     }
 }

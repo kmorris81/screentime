@@ -70,6 +70,11 @@ Plasma on Wayland:
   Failed".
 - **Build-time validation:** a typo or overlapping windows in the schedule
   fail `nixos-rebuild` instead of breaking the daemon at runtime.
+- **Server mode (optional):** keep the schedule and today's overrides on an
+  always-on `screentime-server` (a small container) instead of in each PC's
+  NixOS config, so they can be changed while the PCs are off. The PCs
+  cache the last policy they got and keep enforcing it if the server is
+  down.
 
 ## How it works
 
@@ -215,6 +220,107 @@ login screen and as the user on the lock screen.
   own copy of the shell package in `~/.local/share/plasma/shells/`. That
   only affects the banner, not the password check.
 
+### Server mode
+
+By default each PC's schedule lives in its NixOS config, so changing it (or
+giving bonus time) needs the PC to be on. In server mode a PC gets
+everything from `screentime-server` instead, and you change things there:
+
+```
+ admin: screentime --server pi.lan bonus benny 30m
+                 │ HTTP
+ ┌───────────────▼──────────────┐   POST /api/v1/sync every 30 s:
+ │ screentime-server (container)│◄─ usage up, policy + today's overrides down
+ │ one policy for every kid     │       │
+ └──────────────────────────────┘   screentimed on each PC
+                                    (caches the policy in
+                                     /var/lib/screentime/policy.json)
+```
+
+- **The policy** is one TOML file in the format of
+  `/etc/screentime/config.toml`, covering every kid: the settings
+  (`idle_timeout_secs`, `limit_action`, ...) and a `[users.NAME.days.DAY]`
+  table per kid and day. Each PC uses the settings and its own users'
+  schedules from it. A user the PC manages but the policy doesn't mention
+  gets no time.
+- **Overrides** (`bonus`, `off`, `extend`, `end`, `on`) are kept on the
+  server per user and day; the PC takes today's from the server on every
+  poll, replacing its own. The minutes used are counted on the PC as
+  always, and reported to the server.
+- **If the server is down**, the PC keeps using the last policy and
+  overrides it got, including across reboots. A PC that has *never*
+  reached the server allows no time (fail closed), so start the server
+  before switching a PC over.
+- A PC in server mode only ever uses the server's policy; the Nix
+  schedule and settings are ignored (and `days` must be left empty).
+
+**Run the server** anywhere that's always on, e.g. the Pi-hole box. The
+`Dockerfile` builds a small Alpine image (x86_64 or aarch64) with the
+server and the CLI:
+
+```sh
+docker build -t screentime-server .
+docker run -d --name screentime -p 8470:8470 -v screentime:/data \
+  -e TZ=America/Chicago --restart unless-stopped screentime-server
+```
+
+or with compose, using [`docker-compose.yaml`](docker-compose.yaml) (edit
+its `TZ` first):
+
+```sh
+docker compose up -d --build
+docker compose exec -T screentime screentime config set - < policy.toml
+```
+
+Set `TZ` to the PCs' time zone: "today" on the server is its local date.
+The server keeps everything in `/data/server.json`. Outside a container:
+`screentime-server [--listen 0.0.0.0:8470] [--data DIR]`.
+
+**Upload a policy**, e.g. by combining the kids' current schedules:
+
+```sh
+ssh benny-pc cat /etc/screentime/config.toml > policy.toml   # then add eli's users table
+screentime --server pi.lan config set policy.toml
+```
+
+(`agent_path` in a copied file is ignored.) A bad schedule is rejected
+with the same error the NixOS build would give.
+
+**Switch each PC over**:
+
+```nix
+services.screentime = {
+  enable = true;
+  server.url = "http://pi.lan:8470";
+  users.benny = { }; # who's managed here; the schedule comes from the server
+  loginScreen.enable = true;
+};
+```
+
+After the rebuild, `journalctl -u screentimed` shows `connected to
+http://pi.lan:8470` and `policy from the server applied`.
+
+**Day to day**, use the CLI with `--server` (or set `SCREENTIME_SERVER`)
+from anywhere; it doesn't need root:
+
+```sh
+screentime --server pi.lan status            # everyone, with when each PC last reported
+screentime --server pi.lan bonus benny 30m   # works while benny's PC is off
+screentime --server pi.lan config edit       # edit the policy in $EDITOR
+docker exec screentime screentime status     # the image's CLI points at its server
+```
+
+On a PC in server mode, `sudo screentime bonus ...` and the other changes
+are sent to its server automatically; `screentime status` there still asks
+the local daemon. A change reaches a running PC within about 30 seconds.
+A change to the settings (idle timeout, actions, grace) reaches the agent
+at the user's next login.
+
+The server has no authentication: anyone who can reach port 8470 can
+change the policy, including the kids, e.g. with `curl` from their account.
+Keep it on the home network, and block the port from the kids' PCs'
+user accounts if that matters.
+
 ### Prebuilt binaries
 
 The module doesn't compile anything when `release.json` describes the
@@ -254,6 +360,7 @@ All options live under `services.screentime`.
 | `pamServices` | `[ "login" ]` | PAM services that refuse logins without time left. On NixOS, SDDM's account stack includes `login`, so this covers both graphical and console logins. |
 | `loginScreen.enable` | `false` | Show a screen-time banner on the SDDM login screen and the Plasma lock screen, and explain refused logins. Switches SDDM to the `breeze-screentime` theme and the desktop shell package to a patched copy. |
 | `loginScreen.user` | the managed user, if there's only one | Whose time the login screen banner shows (the lock screen shows whoever is locked). |
+| `server.url` | `null` | Server mode: get the schedule, settings and overrides from this `screentime-server` (e.g. `"http://pi.lan:8470"`; port 8470 if left out). The schedule and settings options above are then ignored, and `users.<name>.days` must be empty. |
 | `package` | prebuilt release if current, else from source | The screentime package. |
 
 The module:
@@ -278,6 +385,10 @@ sudo screentime extend USER 21:30   # allow use past today's window until 21:30
 sudo screentime end USER            # out of time now (limitAction after the grace period)
 sudo screentime on USER             # undo off/extend/end for today (bonus stays)
 screentime help
+
+# with a server (see Server mode); no root needed
+screentime --server URL status|bonus|off|extend|end|on ...
+screentime --server URL config get|set FILE|edit
 ```
 
 Example:
@@ -311,6 +422,7 @@ sudo journalctl _SYSTEMD_USER_UNIT=screentime-agent.service   # agent (idle, tra
 |---|---|
 | `/etc/screentime/config.toml` | Generated config (path overridable with `$SCREENTIME_CONFIG`). |
 | `/var/lib/screentime/state.json` | Today's usage and overrides per user (overridable with `$SCREENTIME_STATE_DIR`). |
+| `/var/lib/screentime/policy.json` | Server mode: the last policy received from the server. |
 | `share/dbus-1/system.d/org.screentime.Daemon1.conf` | Bus policy: only root may own the name; anyone may call it. |
 
 D-Bus interface `org.screentime.Daemon1` at `/org/screentime/Daemon1` on the
@@ -337,7 +449,9 @@ cargo clippy --all-targets
 The code is laid out as:
 - **Library:** `src/` holds the config parsing, schedule evaluation, state
   persistence, D-Bus proxies and tray icon rendering.
-- **Binaries:** the three programs live in `src/bin/`.
+- **Binaries:** the programs live in `src/bin/`: the daemon, agent and CLI
+  for the PCs, and `screentime-server` for server mode (`src/remote.rs` has
+  the shared API types and HTTP client; `Dockerfile` builds its image).
 - **Packaging:** `package.nix` builds the package (running the tests in its
   check phase), `package-bin.nix` installs a prebuilt GitHub release, and
   `module.nix` is the NixOS module.
@@ -383,6 +497,12 @@ The fake supports these environment variables:
   and `org.freedesktop.ScreenSaver.Lock`.
 
 Session `Lock` marks the fake session locked.
+
+To try server mode the same way, start `target/debug/screentime-server
+--listen 127.0.0.1:8470 --data /tmp/st-server`, put
+`server_url = "127.0.0.1:8470"` and an empty `[users.$USER]` table in the
+local config, and upload a policy with `screentime --server 127.0.0.1
+config set FILE`. `SCREENTIME_POLL_SECS=2` makes the daemon poll faster.
 
 ## Limitations
 

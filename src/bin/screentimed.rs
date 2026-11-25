@@ -7,6 +7,9 @@
 //! user out, shuts down or locks the screen through Plasma after a grace
 //! period (`limit_action` / `window_end_action`); if that hasn't happened a
 //! bit later, the daemon does it through logind.
+//!
+//! In server mode it also polls `screentime-server` for the policy and
+//! today's overrides, caching them for when the server is unreachable.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,12 +26,16 @@ use zbus::{Connection, fdo};
 
 use screentime::config::{self, Config, TimeUpAction};
 use screentime::dbus::{LoginManagerProxy, LoginSessionProxy, SKIP_INHIBITORS};
-use screentime::schedule::{fmt_hhmm, parse_hhmm};
-use screentime::state::{self, DayUsage, State};
-use screentime::{BUS_NAME, OBJECT_PATH, Status, duration};
+use screentime::remote::{self, Cached, Policy, Report, SyncRequest};
+use screentime::schedule::parse_hhmm;
+use screentime::state::{self, Change, State};
+use screentime::{BUS_NAME, OBJECT_PATH, Status};
 
 const TICK: Duration = Duration::from_secs(5);
 const SAVE_EVERY: Duration = Duration::from_secs(30);
+/// Server mode: how often to fetch the policy, and how long to wait for it.
+const POLL: Duration = Duration::from_secs(30);
+const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Heartbeat {
     at: Instant,
@@ -97,8 +104,7 @@ impl Iface {
         conn: &Connection,
         hdr: &Header<'_>,
         user: &str,
-        what: &str,
-        change: impl FnOnce(&mut DayUsage),
+        change: Change,
     ) -> fdo::Result<String> {
         let (uid, _) = caller(conn, hdr).await?;
         if uid != 0 {
@@ -107,12 +113,22 @@ impl Iface {
             ));
         }
         let mut sh = self.shared.lock().await;
+        if let Some(url) = &sh.cfg.server_url {
+            // Local changes would be overwritten by the next sync.
+            return Err(fdo::Error::Failed(format!(
+                "this PC is managed by {url}; make changes there (screentime --server {url} ...)"
+            )));
+        }
         if !sh.cfg.users.contains_key(user) {
             return Err(fdo::Error::Failed(format!("{user} is not a managed user")));
         }
-        change(sh.state.today(user, Local::now().date_naive()));
+        let now = Local::now().naive_local();
+        change
+            .check(now.time())
+            .map_err(|e| fdo::Error::InvalidArgs(format!("{e:#}")))?;
+        change.apply(sh.state.today(user, now.date()));
         sh.save();
-        eprintln!("{user}: {what}");
+        eprintln!("{user}: {}", change.describe());
         let st = sh.status(user).expect("checked above");
         serde_json::to_string(&st).map_err(|e| fdo::Error::Failed(e.to_string()))
     }
@@ -175,10 +191,7 @@ impl Iface {
         #[zbus(header)] hdr: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<String> {
-        let sign = if secs < 0 { "-" } else { "+" };
-        let what = format!("bonus {sign}{}", duration::format(secs.unsigned_abs()));
-        self.admin(conn, &hdr, user, &what, |u| u.bonus_secs += secs)
-            .await
+        self.admin(conn, &hdr, user, Change::Bonus(secs)).await
     }
 
     /// No limits or windows for the rest of today (or back off with false).
@@ -189,18 +202,8 @@ impl Iface {
         #[zbus(header)] hdr: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<String> {
-        let what = if on {
-            "limits off for today"
-        } else {
-            "limits back on"
-        };
-        self.admin(conn, &hdr, user, what, |u| {
-            u.unlimited = on;
-            if on {
-                u.ended = false;
-            }
-        })
-        .await
+        let change = if on { Change::Off } else { Change::Clear };
+        self.admin(conn, &hdr, user, change).await
     }
 
     /// Allow use until "HH:MM" today, past the scheduled windows.
@@ -212,18 +215,7 @@ impl Iface {
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<String> {
         let minute = parse_hhmm(until).map_err(|e| fdo::Error::InvalidArgs(format!("{e:#}")))?;
-        let now = Local::now().naive_local().time();
-        if minute <= chrono::Timelike::num_seconds_from_midnight(&now) / 60 {
-            return Err(fdo::Error::InvalidArgs(format!(
-                "{until} has already passed"
-            )));
-        }
-        let what = format!("extended until {}", fmt_hhmm(minute));
-        self.admin(conn, &hdr, user, &what, |u| {
-            u.extend_until = Some(minute);
-            u.ended = false;
-        })
-        .await
+        self.admin(conn, &hdr, user, Change::Extend(minute)).await
     }
 
     /// Out of time for today, right now.
@@ -233,11 +225,7 @@ impl Iface {
         #[zbus(header)] hdr: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<String> {
-        self.admin(conn, &hdr, user, "time ended for today", |u| {
-            u.ended = true;
-            u.unlimited = false;
-        })
-        .await
+        self.admin(conn, &hdr, user, Change::End).await
     }
 
     /// Drop today's off/extend/end overrides (bonus time stays).
@@ -247,12 +235,7 @@ impl Iface {
         #[zbus(header)] hdr: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<String> {
-        self.admin(conn, &hdr, user, "overrides cleared", |u| {
-            u.unlimited = false;
-            u.ended = false;
-            u.extend_until = None;
-        })
-        .await
+        self.admin(conn, &hdr, user, Change::Clear).await
     }
 }
 
@@ -434,6 +417,134 @@ async fn tick(
     Ok(())
 }
 
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Server mode: apply a policy from the server (or the cache at startup).
+/// `local` is the server-mode config from /etc. Today's overrides replace
+/// the local ones; the usage counted here stays.
+fn apply_policy(sh: &mut Shared, local: &Config, policy: &Policy, config_changed: bool) {
+    if config_changed {
+        match local.with_policy(&policy.config) {
+            Ok(cfg) => {
+                eprintln!("policy from the server applied");
+                sh.cfg = cfg;
+            }
+            Err(e) => eprintln!("ignoring the server's policy: {e:#}"),
+        }
+    }
+    let today = Local::now().date_naive();
+    let mut changed = false;
+    for user in sh.uids.keys().cloned().collect::<Vec<_>>() {
+        let theirs = policy
+            .overrides
+            .get(&user)
+            .filter(|o| o.date == today)
+            .cloned()
+            .unwrap_or_else(|| state::DayUsage::new(today));
+        let ours = sh.state.today(&user, today);
+        let before = ours.clone();
+        ours.bonus_secs = theirs.bonus_secs;
+        ours.unlimited = theirs.unlimited;
+        ours.ended = theirs.ended;
+        ours.extend_until = theirs.extend_until;
+        if *ours != before {
+            eprintln!(
+                "{user}: overrides from the server: bonus {}s, off {}, ended {}, extended {:?}",
+                ours.bonus_secs, ours.unlimited, ours.ended, ours.extend_until
+            );
+            changed = true;
+        }
+    }
+    if changed {
+        // pam-check reads the state file: write it now, not in 30 s.
+        sh.save();
+    }
+}
+
+/// Server mode: poll the server forever. Failures keep the last policy.
+async fn sync_loop(shared: Arc<Mutex<Shared>>, local: Config, url: String) {
+    // Overridable for testing.
+    let poll = std::env::var("SCREENTIME_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(POLL, Duration::from_secs);
+    let client = remote::Client::new(&url, POLL_TIMEOUT);
+    let host = hostname();
+    let cache_path = remote::cache_path();
+    let mut last = Cached::load(&cache_path).ok().flatten();
+    let mut reachable: Option<bool> = None;
+    loop {
+        let req = {
+            let sh = shared.lock().await;
+            let today = Local::now().date_naive();
+            SyncRequest {
+                host: host.clone(),
+                users: sh
+                    .uids
+                    .keys()
+                    .filter_map(|u| sh.status(u))
+                    .map(|status| Report {
+                        date: today,
+                        status,
+                    })
+                    .collect(),
+            }
+        };
+        let c = client.clone();
+        let reply = tokio::task::spawn_blocking(move || c.sync(&req))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+        match reply {
+            Ok(policy) => {
+                if reachable != Some(true) {
+                    eprintln!("connected to {}", client.base());
+                    reachable = Some(true);
+                }
+                let changed = last.as_ref().is_none_or(|c| c.policy != policy);
+                let config_changed = last
+                    .as_ref()
+                    .is_none_or(|c| c.policy.config != policy.config);
+                if changed {
+                    let cached = Cached {
+                        received_at: Local::now(),
+                        policy,
+                    };
+                    // Cache first, so pam-check and the agent agree with us.
+                    if let Err(e) = cached.save(&cache_path) {
+                        eprintln!("caching the policy: {e:#}");
+                    }
+                    let mut sh = shared.lock().await;
+                    apply_policy(&mut sh, &local, &cached.policy, config_changed);
+                    last = Some(cached);
+                } else if let Some(cached) = &last {
+                    // Same policy; still re-apply overrides after midnight.
+                    let mut sh = shared.lock().await;
+                    apply_policy(&mut sh, &local, &cached.policy, false);
+                }
+            }
+            Err(e) => {
+                if reachable != Some(false) {
+                    let using = match &last {
+                        Some(c) => format!(
+                            "using the policy received {}",
+                            c.received_at.format("%Y-%m-%d %H:%M")
+                        ),
+                        None => "no policy received yet, so no time is allowed".to_string(),
+                    };
+                    eprintln!("can't reach the server ({e:#}); {using}");
+                    reachable = Some(false);
+                }
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // `screentimed --check FILE`: validate a config (used at build time).
@@ -446,7 +557,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cfg = Config::load(&config::path())?;
+    let local = Config::load(&config::path())?;
+    let cfg = config::load()?;
     let state_path = state::path();
     let state = State::load(&state_path)?;
     let uids = lookup_uids(cfg.users.keys().cloned())?;
@@ -455,6 +567,17 @@ async fn main() -> Result<()> {
         uids.keys().collect::<Vec<_>>(),
         cfg.idle_timeout_secs
     );
+    if let Some(url) = &local.server_url {
+        match Cached::load(&remote::cache_path()) {
+            Ok(Some(c)) => eprintln!(
+                "server mode ({url}); policy received {}",
+                c.received_at.format("%Y-%m-%d %H:%M")
+            ),
+            _ => eprintln!(
+                "server mode ({url}); no policy yet, so no time is allowed until it arrives"
+            ),
+        }
+    }
 
     let shared = Arc::new(Mutex::new(Shared {
         cfg,
@@ -483,6 +606,9 @@ async fn main() -> Result<()> {
         .await
         .context("connecting to the system bus")?;
     let login = LoginManagerProxy::new(&conn).await?;
+    if let Some(url) = local.server_url.clone() {
+        tokio::spawn(sync_loop(shared.clone(), local, url));
+    }
 
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

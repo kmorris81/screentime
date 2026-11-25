@@ -380,7 +380,7 @@ async fn time_up(conn: &zbus::Connection, action: TimeUpAction) -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let cfg = Config::load(&config::path())?;
+    let cfg = config::load()?;
 
     let (idle_tx, mut idle_rx) = watch::channel(false);
     let timeout = Duration::from_secs(cfg.idle_timeout_secs);

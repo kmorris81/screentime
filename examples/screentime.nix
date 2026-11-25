@@ -4,6 +4,16 @@
 #
 # For a second PC, copy this file and change `kid`: everything below is
 # keyed on it (e.g. "benny" on one machine, "eli" on the other).
+#
+# Server mode instead keeps the schedule on screentime-server (see
+# README.md and policy.toml); the PC then only needs:
+#
+#   services.screentime = {
+#     enable = true;
+#     server.url = "http://pi.lan:8470";
+#     users.benny = { };
+#     loginScreen.enable = true;
+#   };
 let
   kid = "benny";
   weekday = {

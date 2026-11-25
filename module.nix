@@ -61,7 +61,17 @@ let
     inherit (cfg.loginScreen) user;
   };
 
-  settings = {
+  serverMode = cfg.server.url != null;
+
+  # Server mode: only the server's address and who's managed here; the
+  # schedule and settings come from the server.
+  serverSettings = {
+    server_url = cfg.server.url;
+    agent_path = "${cfg.package}/bin/screentime-agent";
+    users = lib.mapAttrs (_: _: { }) cfg.users;
+  };
+
+  localSettings = {
     idle_timeout_secs = cfg.idleMinutes * 60;
     input_idle_only = cfg.inputIdleOnly;
     logout_grace_secs = cfg.logoutGraceSeconds;
@@ -81,7 +91,9 @@ let
   configFile =
     pkgs.runCommand "screentime.toml"
       {
-        raw = (pkgs.formats.toml { }).generate "screentime-raw.toml" settings;
+        raw = (pkgs.formats.toml { }).generate "screentime-raw.toml" (
+          if serverMode then serverSettings else localSettings
+        );
       }
       ''
         ${cfg.package}/bin/screentimed --check "$raw"
@@ -173,12 +185,38 @@ in
           options.days = mkOption {
             type = types.attrsOf dayType;
             default = { };
-            description = "Per-day rules keyed mon..sun. Missing days aren't allowed.";
+            description = ''
+              Per-day rules keyed mon..sun. Missing days aren't allowed.
+              Must be left empty in server mode.
+            '';
           };
         }
       );
       default = { };
-      description = "Users whose screen time is limited.";
+      example = lib.literalExpression "{ benny = { }; } # server mode";
+      description = ''
+        Users whose screen time is limited. In server mode, declare them
+        with no days (`users.benny = { };`): their schedule comes from the
+        server.
+      '';
+    };
+
+    server.url = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "http://pi.lan:8470";
+      description = ''
+        Server mode: get the schedule, the settings and today's overrides
+        from this `screentime-server` instead of this configuration. The
+        daemon polls it every 30 seconds and caches the last policy it got,
+        which it keeps using while the server is unreachable. Until it has
+        reached the server once, managed users get no time at all.
+
+        In server mode `users.<name>.days`, `idleMinutes`, `inputIdleOnly`,
+        `limitAction`, `windowEndAction`, `logoutGraceSeconds` and
+        `forceLogoutSeconds` are ignored: set them in the server's policy.
+        A URL without a port uses 8470.
+      '';
     };
 
     pamServices = mkOption {
@@ -218,10 +256,15 @@ in
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
       {
-        assertions = lib.mapAttrsToList (name: user: {
-          assertion = lib.all (d: lib.elem d dayNames) (lib.attrNames user.days);
-          message = "services.screentime.users.${name}.days: day names must be one of ${lib.concatStringsSep ", " dayNames}";
-        }) cfg.users;
+        assertions =
+          lib.mapAttrsToList (name: user: {
+            assertion = lib.all (d: lib.elem d dayNames) (lib.attrNames user.days);
+            message = "services.screentime.users.${name}.days: day names must be one of ${lib.concatStringsSep ", " dayNames}";
+          }) cfg.users
+          ++ lib.mapAttrsToList (name: user: {
+            assertion = serverMode -> user.days == { };
+            message = "services.screentime.users.${name}.days must be empty with services.screentime.server.url set: the schedule comes from the server.";
+          }) cfg.users;
 
         environment.etc."screentime/config.toml".source = configFile;
         environment.systemPackages = [ cfg.package ];

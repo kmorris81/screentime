@@ -62,6 +62,16 @@ and hard-won lessons that aren't obvious from the code.
   `sufficient` rule. Referencing another rule's order (e.g.
   `rules.account.unix`) broke evaluation because that rule doesn't exist on
   every service.
+- **Server mode** (`server.url`, `screentime-server`, `src/remote.rs`):
+  a PC in server mode only ever uses the server's policy, never the Nix
+  schedule; that was the parent's explicit choice. It caches the last
+  policy in `/var/lib/screentime/policy.json` and uses it while the server
+  is unreachable; with no cache it allows no time. `config::load()` gives
+  the effective config, and every reader (daemon, agent, pam-check) must
+  use it rather than `Config::load` on the /etc file. Today's overrides
+  are owned by the server in that mode: the daemon refuses local D-Bus
+  admin calls and replaces its overrides with the server's on every poll.
+  No authentication, on purpose: the parent wanted a simple mechanism.
 - **Fail closed.** The agent runs as the kid and is untrusted: missing
   heartbeats count as active, heartbeats are accepted only from the packaged
   agent binary (checked via `/proc/<pid>/exe`), and `pam-check` refuses on any

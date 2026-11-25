@@ -1,0 +1,25 @@
+# screentime-server for server mode (see "Server mode" in README.md).
+#
+#   docker compose up -d --build
+#   docker compose exec -T screentime screentime config set - < policy.toml
+#   docker compose exec screentime screentime status
+#   docker compose logs -f
+#
+# To build without cloning the repo, replace `build: .` with
+#   build: https://github.com/kmorris81/screentime.git
+services:
+  screentime:
+    build: .
+    image: screentime-server
+    container_name: screentime
+    ports:
+      - "8470:8470"
+    volumes:
+      - screentime-data:/data
+    environment:
+      # The PCs' time zone: "today" (overrides, status) is the server's date.
+      TZ: America/Chicago
+    restart: unless-stopped
+
+volumes:
+  screentime-data:
